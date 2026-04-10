@@ -1,0 +1,3 @@
+{"transaction_id":"tx-1001","user_id":"user-1","account_id":"account-1","command_type":"place_order","instrument_symbol":"BTCUSDT","quantity":0.25,"price":42000.0}
+{"transaction_id":"tx-1002","user_id":"user-1","account_id":"account-1","command_type":"place_order","instrument_symbol":"ETHUSDT","quantity":1.50,"price":3200.0}
+{"transaction_id":"tx-1003","user_id":"user-2","account_id":"account-2","command_type":"cancel_order","instrument_symbol":"BTCUSDT","quantity":1.00,"price":42150.0}
