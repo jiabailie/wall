@@ -22,6 +22,7 @@
 #include "market_data/feed_health_tracker.hpp"
 #include "monitoring/health_status.hpp"
 #include "monitoring/logger.hpp"
+#include "monitoring/metrics.hpp"
 #include "portfolio/portfolio_service.hpp"
 #include "risk/risk_engine.hpp"
 #include "storage/storage_interfaces.hpp"
@@ -93,6 +94,43 @@ private:
     std::vector<trading::infrastructure::RawKafkaMessage> commits_;
     std::vector<trading::infrastructure::RawKafkaMessage> seeks_;
     std::size_t next_index_ {0};
+};
+
+class SteppingClock final : public trading::core::IClock {
+public:
+    explicit SteppingClock(const std::int64_t start_ms, const std::int64_t step_ms)
+        : current_ms_(start_ms), step_ms_(step_ms) {}
+
+    std::int64_t now_ms() const override {
+        const auto value = current_ms_;
+        current_ms_ += step_ms_;
+        return value;
+    }
+
+private:
+    mutable std::int64_t current_ms_;
+    std::int64_t step_ms_ {0};
+};
+
+class ThrowingTransactionRepository final : public trading::storage::ITransactionRepository {
+public:
+    void save_received(const trading::core::TransactionCommand&) override {
+        throw std::runtime_error("save_received failed");
+    }
+
+    void save_processed(const std::string&, const std::string&) override {
+        throw std::runtime_error("save_processed failed");
+    }
+
+    std::vector<trading::storage::TransactionRecord> all_records() const override {
+        return {};
+    }
+
+    void save_checkpoint(const trading::storage::KafkaCheckpoint&) override {}
+
+    std::vector<trading::storage::KafkaCheckpoint> all_checkpoints() const override {
+        return {};
+    }
 };
 
 // Returns a reusable BTC instrument fixture for tests.
@@ -282,6 +320,21 @@ void test_runtime_health_status_transitions() {
         trading::monitoring::HealthStatus::unavailable,
         "execution component should be unavailable");
     expect_equal(health.overall_status(), trading::monitoring::HealthStatus::unavailable, "unavailable component should roll up unavailable");
+}
+
+// Verifies counters and latency samples are aggregated in memory.
+void test_in_memory_metrics_collector_records_counters_and_latency() {
+    trading::monitoring::InMemoryMetricsCollector metrics;
+    metrics.increment("fills_applied");
+    metrics.increment("fills_applied", 2);
+    metrics.observe_latency("runtime_event_latency_ms", 3);
+    metrics.observe_latency("runtime_event_latency_ms", 7);
+
+    expect_equal(metrics.counter("fills_applied"), std::int64_t {3}, "metrics counter should aggregate increments");
+    const auto latency = metrics.latency("runtime_event_latency_ms");
+    expect_equal(latency.sample_count, std::int64_t {2}, "latency metric should record sample count");
+    expect_equal(latency.total_ms, std::int64_t {10}, "latency metric should record total latency");
+    expect_equal(latency.max_ms, std::int64_t {7}, "latency metric should record max latency");
 }
 
 // Verifies the controller drains queued events in FIFO order.
@@ -556,10 +609,12 @@ void test_feed_health_tracker_detects_stale_and_disconnect_states() {
 // Verifies the live feed controller reconnects and resubscribes after disconnects.
 void test_live_market_data_feed_controller_reconnects_and_resubscribes() {
     trading::exchange::MockMarketDataFeedSession session;
+    trading::monitoring::InMemoryMetricsCollector metrics;
     trading::exchange::LiveMarketDataFeedController controller(
         session,
         {"BTCUSDT", "ETHUSDT"},
-        2);
+        2,
+        &metrics);
 
     controller.start();
     expect_true(controller.connected(), "controller should be connected after start");
@@ -573,6 +628,8 @@ void test_live_market_data_feed_controller_reconnects_and_resubscribes() {
     expect_equal(session.disconnect_calls(), std::size_t {1}, "disconnect should be forwarded");
     expect_equal(session.connect_calls(), std::size_t {2}, "reconnect should call connect again");
     expect_equal(session.subscribe_calls(), std::size_t {2}, "reconnect should resubscribe");
+    expect_equal(metrics.counter("market_data_disconnects"), std::int64_t {1}, "disconnect metric should increment");
+    expect_equal(metrics.counter("market_data_reconnects"), std::int64_t {1}, "reconnect metric should increment");
 }
 
 // Verifies the live feed controller stops after exhausting reconnect attempts.
@@ -1421,6 +1478,101 @@ void test_simulation_runtime_applies_partial_and_completion_fills() {
     expect_equal(position->net_quantity, 1.0, "partial and completion fills should produce full target quantity");
 }
 
+// Verifies pause trading blocks strategy-generated orders and records operational metrics.
+void test_simulation_runtime_pause_trading_blocks_orders() {
+    trading::core::FixedClock clock(5000);
+    trading::monitoring::InMemoryMetricsCollector metrics;
+    trading::app::RuntimeOperationalControls controls;
+    controls.pause_trading();
+
+    trading::app::SimulationRuntime runtime(
+        clock,
+        {
+            .max_order_quantity = 1.0,
+            .max_order_notional = 50000.0,
+            .max_position_quantity = 2.0,
+            .stale_after_ms = 1000,
+            .kill_switch_enabled = false,
+        },
+        {
+            .strategy = {
+                .strategy_id = "threshold-1",
+                .instrument_id = "binance:BTCUSDT",
+                .trigger_price = 42000.0,
+                .order_quantity = 0.05,
+                .side = trading::core::OrderSide::buy,
+            },
+            .execution = {
+                .partial_fill_threshold = 1.0,
+                .partial_fill_ratio = 0.5,
+            },
+            .auto_complete_partial_fills = false,
+        },
+        &controls,
+        &metrics);
+
+    runtime.on_event(trading::core::MarketEvent {
+        .event_id = "market-1",
+        .type = trading::core::MarketEventType::trade,
+        .instrument = make_btc_instrument(),
+        .price = 41990.0,
+        .quantity = 0.5,
+        .process_timestamp = 4900,
+    });
+
+    expect_true(runtime.trading_paused(), "runtime should observe paused trading control");
+    expect_equal(runtime.risk_approved_count(), std::size_t {0}, "paused trading should block order approval");
+    expect_equal(runtime.applied_fill_count(), std::size_t {0}, "paused trading should block fills");
+    expect_equal(metrics.counter("orders_paused"), std::int64_t {1}, "paused order metric should increment");
+}
+
+// Verifies runtime metrics capture fills, approvals, and per-event latency.
+void test_simulation_runtime_records_metrics() {
+    SteppingClock clock(5000, 2);
+    trading::monitoring::InMemoryMetricsCollector metrics;
+    trading::app::RuntimeOperationalControls controls;
+
+    trading::app::SimulationRuntime runtime(
+        clock,
+        {
+            .max_order_quantity = 1.0,
+            .max_order_notional = 50000.0,
+            .max_position_quantity = 2.0,
+            .stale_after_ms = 1000,
+            .kill_switch_enabled = false,
+        },
+        {
+            .strategy = {
+                .strategy_id = "threshold-1",
+                .instrument_id = "binance:BTCUSDT",
+                .trigger_price = 42000.0,
+                .order_quantity = 0.05,
+                .side = trading::core::OrderSide::buy,
+            },
+            .execution = {
+                .partial_fill_threshold = 1.0,
+                .partial_fill_ratio = 0.5,
+            },
+            .auto_complete_partial_fills = false,
+        },
+        &controls,
+        &metrics);
+
+    runtime.on_event(trading::core::MarketEvent {
+        .event_id = "market-1",
+        .type = trading::core::MarketEventType::trade,
+        .instrument = make_btc_instrument(),
+        .price = 41990.0,
+        .quantity = 0.5,
+        .process_timestamp = 4900,
+    });
+
+    expect_equal(metrics.counter("market_events"), std::int64_t {1}, "market event metric should increment");
+    expect_equal(metrics.counter("orders_approved"), std::int64_t {1}, "approved order metric should increment");
+    expect_equal(metrics.counter("fills_applied"), std::int64_t {1}, "fill metric should increment");
+    expect_equal(metrics.latency("runtime_event_latency_ms").sample_count, std::int64_t {1}, "runtime latency should be recorded");
+}
+
 // Verifies order repository save and lifecycle update behavior.
 void test_in_memory_order_repository_save_and_update() {
     trading::storage::InMemoryOrderRepository repository;
@@ -2092,6 +2244,44 @@ void test_kafka_transaction_consumer_skips_malformed_messages() {
     expect_equal(fake_client.commits()[0].offset, std::int64_t {10}, "committed malformed offset should match");
 }
 
+// Verifies bursts of malformed Kafka payloads are drained safely before the next valid message.
+void test_kafka_transaction_consumer_skips_malformed_payload_burst() {
+    FakeKafkaConsumerClient fake_client({
+        {
+            .topic = "trading-transactions",
+            .partition = 0,
+            .offset = 20,
+            .payload = "broken",
+        },
+        {
+            .topic = "trading-transactions",
+            .partition = 0,
+            .offset = 21,
+            .payload = "transaction_id=tx-bad-2;quantity=oops",
+        },
+        {
+            .topic = "trading-transactions",
+            .partition = 0,
+            .offset = 22,
+            .payload =
+                "transaction_id=tx-good-burst;"
+                "user_id=user-1;"
+                "account_id=account-1;"
+                "command_type=place_order;"
+                "instrument_symbol=BTCUSDT;"
+                "quantity=0.75",
+        },
+    });
+    trading::infrastructure::KafkaTransactionConsumer consumer(fake_client, "trading-transactions");
+
+    const auto command = consumer.poll();
+    expect_true(command.has_value(), "consumer should recover after malformed burst");
+    expect_equal(command->transaction_id, std::string("tx-good-burst"), "first valid message after malformed burst should be returned");
+    expect_equal(fake_client.commits().size(), std::size_t {2}, "all malformed payloads should be committed");
+    expect_equal(fake_client.commits()[0].offset, std::int64_t {20}, "first malformed offset should be committed");
+    expect_equal(fake_client.commits()[1].offset, std::int64_t {21}, "second malformed offset should be committed");
+}
+
 // Verifies commit checkpoints are controlled by ingestor processing, not by poll.
 void test_kafka_transaction_consumer_commit_checkpoint_behavior() {
     FakeKafkaConsumerClient fake_client({
@@ -2214,6 +2404,53 @@ void test_transaction_ingestor_rejects_invalid_messages() {
     expect_equal(consumer.committed().size(), std::size_t {1}, "invalid transaction should still be committed");
 }
 
+// Verifies ingestion metrics capture throughput, rejects, and latency.
+void test_transaction_ingestor_records_metrics() {
+    trading::core::EventDispatcher dispatcher;
+    trading::core::FixedClock clock(1000);
+    trading::monitoring::InMemoryMetricsCollector metrics;
+
+    auto invalid = make_transaction("tx-bad", 31);
+    invalid.quantity = 0.0;
+
+    trading::ingestion::MockTransactionConsumer consumer({
+        make_transaction("tx-good", 30),
+        invalid,
+    });
+    trading::storage::InMemoryTransactionRepository repository;
+    trading::storage::InMemoryTransactionCache cache;
+    trading::ingestion::TransactionIngestor ingestor(consumer, repository, cache, dispatcher, &clock, &metrics);
+
+    expect_true(ingestor.process_next(), "first message should be processed");
+    expect_true(ingestor.process_next(), "second message should be handled as rejected");
+
+    expect_equal(metrics.counter("transactions_received"), std::int64_t {2}, "received counter should include all handled messages");
+    expect_equal(metrics.counter("transactions_processed"), std::int64_t {1}, "processed counter should include valid messages");
+    expect_equal(metrics.counter("transactions_rejected"), std::int64_t {1}, "rejected counter should include invalid messages");
+    expect_equal(metrics.latency("transaction_processing_latency_ms").sample_count, std::int64_t {2}, "latency samples should be recorded per handled message");
+}
+
+// Verifies persistence failures are surfaced and counted during ingestion.
+void test_transaction_ingestor_counts_persistence_failures() {
+    trading::core::EventDispatcher dispatcher;
+    trading::core::FixedClock clock(1000);
+    trading::monitoring::InMemoryMetricsCollector metrics;
+    trading::ingestion::MockTransactionConsumer consumer({make_transaction("tx-1", 40)});
+    ThrowingTransactionRepository repository;
+    trading::storage::InMemoryTransactionCache cache;
+    trading::ingestion::TransactionIngestor ingestor(consumer, repository, cache, dispatcher, &clock, &metrics);
+
+    bool threw = false;
+    try {
+        ingestor.process_next();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+
+    expect_true(threw, "persistence failure should propagate");
+    expect_equal(metrics.counter("persistence_failures"), std::int64_t {1}, "persistence failure metric should increment");
+}
+
 // Verifies stub exchange adapters satisfy the market/execution interface contracts.
 void test_exchange_adapter_stub_integration() {
     const auto instrument = make_btc_instrument();
@@ -2320,6 +2557,7 @@ int main() {
         {"in_memory_structured_logger_records", test_in_memory_structured_logger_records},
         {"console_structured_logger_writes_output", test_console_structured_logger_writes_output},
         {"runtime_health_status_transitions", test_runtime_health_status_transitions},
+        {"in_memory_metrics_collector_records_counters_and_latency", test_in_memory_metrics_collector_records_counters_and_latency},
         {"engine_controller_queue_order", test_engine_controller_queue_order},
         {"engine_controller_due_timers", test_engine_controller_due_timers},
         {"engine_controller_mock_sources_and_empty_dispatch", test_engine_controller_mock_sources_and_empty_dispatch},
@@ -2352,6 +2590,8 @@ int main() {
         {"simulation_runtime_happy_path", test_simulation_runtime_happy_path},
         {"simulation_runtime_risk_rejection_stops_execution", test_simulation_runtime_risk_rejection_stops_execution},
         {"simulation_runtime_applies_partial_and_completion_fills", test_simulation_runtime_applies_partial_and_completion_fills},
+        {"simulation_runtime_pause_trading_blocks_orders", test_simulation_runtime_pause_trading_blocks_orders},
+        {"simulation_runtime_records_metrics", test_simulation_runtime_records_metrics},
         {"in_memory_order_repository_save_and_update", test_in_memory_order_repository_save_and_update},
         {"in_memory_position_repository_update", test_in_memory_position_repository_update},
         {"in_memory_market_state_cache_write_read", test_in_memory_market_state_cache_write_read},
@@ -2370,12 +2610,15 @@ int main() {
         {"replay_service_isolated_from_live_clock", test_replay_service_isolated_from_live_clock},
         {"kafka_transaction_consumer_parses_payload", test_kafka_transaction_consumer_parses_payload},
         {"kafka_transaction_consumer_skips_malformed_messages", test_kafka_transaction_consumer_skips_malformed_messages},
+        {"kafka_transaction_consumer_skips_malformed_payload_burst", test_kafka_transaction_consumer_skips_malformed_payload_burst},
         {"kafka_transaction_consumer_commit_checkpoint_behavior", test_kafka_transaction_consumer_commit_checkpoint_behavior},
         {"kafka_transaction_producer_serializes_payload", test_kafka_transaction_producer_serializes_payload},
         {"transaction_publisher_parses_json_line", test_transaction_publisher_parses_json_line},
         {"transaction_publisher_rejects_invalid_json_line", test_transaction_publisher_rejects_invalid_json_line},
         {"transaction_ingestor_order_and_commit", test_transaction_ingestor_order_and_commit},
         {"transaction_ingestor_rejects_invalid_messages", test_transaction_ingestor_rejects_invalid_messages},
+        {"transaction_ingestor_records_metrics", test_transaction_ingestor_records_metrics},
+        {"transaction_ingestor_counts_persistence_failures", test_transaction_ingestor_counts_persistence_failures},
         {"exchange_adapter_stub_integration", test_exchange_adapter_stub_integration},
         {"exchange_market_payload_normalization_contract", test_exchange_market_payload_normalization_contract},
         {"exchange_error_mapping_behavior", test_exchange_error_mapping_behavior},

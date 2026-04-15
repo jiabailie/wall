@@ -7,8 +7,11 @@ namespace trading::app {
 
 SimulationRuntime::SimulationRuntime(const trading::core::IClock& clock,
                                      const trading::config::RiskConfig& risk_config,
-                                     SimulationRuntimeConfig runtime_config)
-    : market_state_store_(clock),
+                                     SimulationRuntimeConfig runtime_config,
+                                     RuntimeOperationalControls* controls,
+                                     trading::monitoring::IMetricsCollector* metrics)
+    : clock_(clock),
+      market_state_store_(clock),
       strategy_(std::move(runtime_config.strategy)),
       strategy_context_({
           .market_state_store = market_state_store_,
@@ -16,10 +19,13 @@ SimulationRuntime::SimulationRuntime(const trading::core::IClock& clock,
       }),
       risk_engine_(risk_config, market_state_store_, clock),
       execution_engine_(runtime_config.execution),
+      controls_(controls),
+      metrics_(metrics),
       auto_complete_partial_fills_(runtime_config.auto_complete_partial_fills) {}
 
 // Handles one incoming engine event through market, strategy, risk, execution, and portfolio.
 void SimulationRuntime::on_event(const trading::core::EngineEvent& event) {
+    const auto event_started_ms = clock_.now_ms();
     if (const auto* market_event = std::get_if<trading::core::MarketEvent>(&event)) {
         market_state_store_.apply(*market_event);
         if (market_event->price > 0.0) {
@@ -29,13 +35,29 @@ void SimulationRuntime::on_event(const trading::core::EngineEvent& event) {
 
     const auto requests = strategy_.on_event(event, strategy_context_);
     for (const auto& request : requests) {
+        const auto request_started_ms = clock_.now_ms();
+        if (controls_ != nullptr && controls_->trading_paused()) {
+            if (metrics_ != nullptr) {
+                metrics_->increment("orders_paused");
+                metrics_->observe_latency("order_processing_latency_ms", clock_.now_ms() - request_started_ms);
+            }
+            continue;
+        }
+
         const auto decision = risk_engine_.evaluate(request);
         if (!decision.approved) {
             ++risk_rejected_count_;
+            if (metrics_ != nullptr) {
+                metrics_->increment("risk_rejects");
+                metrics_->observe_latency("order_processing_latency_ms", clock_.now_ms() - request_started_ms);
+            }
             continue;
         }
 
         ++risk_approved_count_;
+        if (metrics_ != nullptr) {
+            metrics_->increment("orders_approved");
+        }
         const auto result = execution_engine_.submit(request);
         handle_execution_result(result);
 
@@ -48,6 +70,20 @@ void SimulationRuntime::on_event(const trading::core::EngineEvent& event) {
         if (auto_complete_partial_fills_ && has_partial_update) {
             handle_execution_result(execution_engine_.complete_open_order(result.order_id));
         }
+
+        if (metrics_ != nullptr) {
+            metrics_->observe_latency("order_processing_latency_ms", clock_.now_ms() - request_started_ms);
+        }
+    }
+
+    if (metrics_ != nullptr) {
+        if (std::get_if<trading::core::TransactionCommand>(&event) != nullptr) {
+            metrics_->increment("transaction_events");
+        }
+        if (std::get_if<trading::core::MarketEvent>(&event) != nullptr) {
+            metrics_->increment("market_events");
+        }
+        metrics_->observe_latency("runtime_event_latency_ms", clock_.now_ms() - event_started_ms);
     }
 }
 
@@ -56,6 +92,9 @@ void SimulationRuntime::handle_execution_result(const trading::execution::Execut
     for (const auto& fill : result.fills) {
         portfolio_service_.apply_fill(fill);
         ++applied_fill_count_;
+        if (metrics_ != nullptr) {
+            metrics_->increment("fills_applied");
+        }
     }
 }
 
