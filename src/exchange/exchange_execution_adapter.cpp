@@ -72,4 +72,60 @@ trading::execution::ExecutionResult SimulatedExchangeExecutionAdapter::cancel(co
     return engine_.cancel_open_order(order_id);
 }
 
+ExchangeExecutionCapabilities MockLiveExchangeExecutionAdapter::capabilities() const {
+    return ExchangeExecutionCapabilities {
+        .supports_cancel = true,
+        .supports_replace = false,
+        .supports_market_orders = true,
+    };
+}
+
+trading::execution::ExecutionResult MockLiveExchangeExecutionAdapter::submit(const trading::core::OrderRequest& request) {
+    const auto order_id = "live-order-" + std::to_string(next_order_id_++);
+    const auto client_order_id = "live-client-" + std::to_string(next_client_order_id_++);
+    tracker_.register_order(request, order_id, client_order_id);
+
+    return trading::execution::ExecutionResult {
+        .order_id = order_id,
+        .client_order_id = client_order_id,
+        .updates = {
+            trading::core::OrderUpdate {
+                .order_id = order_id,
+                .client_order_id = client_order_id,
+                .status = trading::core::OrderStatus::pending_submit,
+                .filled_quantity = 0.0,
+                .reason = std::nullopt,
+            },
+        },
+        .fills = {},
+    };
+}
+
+trading::execution::ExecutionResult MockLiveExchangeExecutionAdapter::cancel(const std::string& order_id,
+                                                                              const std::string& client_order_id) {
+    return trading::execution::ExecutionResult {
+        .order_id = order_id,
+        .client_order_id = client_order_id,
+        .updates = {
+            trading::core::OrderUpdate {
+                .order_id = order_id,
+                .client_order_id = client_order_id,
+                .status = trading::core::OrderStatus::pending_cancel,
+                .filled_quantity = 0.0,
+                .reason = std::nullopt,
+            },
+        },
+        .fills = {},
+    };
+}
+
+trading::execution::ReconciliationResult MockLiveExchangeExecutionAdapter::apply_exchange_report(
+    const trading::execution::ExecutionReport& report) {
+    return tracker_.apply_report(report);
+}
+
+std::optional<trading::storage::OrderRecord> MockLiveExchangeExecutionAdapter::get_order(const std::string& order_id) const {
+    return tracker_.get_order(order_id);
+}
+
 }  // namespace trading::exchange

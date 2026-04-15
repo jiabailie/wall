@@ -9,6 +9,7 @@
 #include "core/types.hpp"
 #include "exchange/exchange_execution_adapter.hpp"
 #include "exchange/exchange_market_data_adapter.hpp"
+#include "execution/live_execution_tracker.hpp"
 #include "execution/simulated_execution_engine.hpp"
 #include "infrastructure/postgres_repositories.hpp"
 #include "infrastructure/kafka_transaction_consumer.hpp"
@@ -861,6 +862,179 @@ void test_simulated_execution_engine_cancel_open_order() {
     expect_equal(cancel_result.updates.size(), std::size_t {2}, "cancel should produce pending-cancel and canceled updates");
     expect_equal(cancel_result.updates[0].status, trading::core::OrderStatus::pending_cancel, "first cancel update should be pending_cancel");
     expect_equal(cancel_result.updates[1].status, trading::core::OrderStatus::canceled, "second cancel update should be canceled");
+}
+
+// Verifies live execution reports drive a full local order lifecycle and fill generation.
+void test_live_execution_tracker_applies_full_lifecycle() {
+    trading::execution::LiveExecutionTracker tracker;
+    const auto instrument = make_btc_instrument();
+
+    tracker.register_order(
+        {
+            .request_id = "req-1",
+            .strategy_id = "strategy-1",
+            .instrument = instrument,
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 1.0,
+            .price = 42000.0,
+        },
+        "live-order-1",
+        "live-client-1");
+
+    const auto ack_result = tracker.apply_report({
+        .report_id = "report-ack-1",
+        .order_id = "live-order-1",
+        .client_order_id = "live-client-1",
+        .instrument = instrument,
+        .side = trading::core::OrderSide::buy,
+        .status = trading::core::OrderStatus::acknowledged,
+        .cumulative_filled_quantity = 0.0,
+        .exchange_timestamp = 1000,
+    });
+    const auto partial_result = tracker.apply_report({
+        .report_id = "report-fill-1",
+        .order_id = "live-order-1",
+        .client_order_id = "live-client-1",
+        .instrument = instrument,
+        .side = trading::core::OrderSide::buy,
+        .status = trading::core::OrderStatus::partially_filled,
+        .cumulative_filled_quantity = 0.4,
+        .last_fill_price = 42000.0,
+        .last_fill_fee = 1.0,
+        .exchange_timestamp = 1010,
+    });
+    const auto final_result = tracker.apply_report({
+        .report_id = "report-fill-2",
+        .order_id = "live-order-1",
+        .client_order_id = "live-client-1",
+        .instrument = instrument,
+        .side = trading::core::OrderSide::buy,
+        .status = trading::core::OrderStatus::filled,
+        .cumulative_filled_quantity = 1.0,
+        .last_fill_price = 42010.0,
+        .last_fill_fee = 1.5,
+        .exchange_timestamp = 1020,
+    });
+
+    expect_true(ack_result.applied, "acknowledgement report should apply");
+    expect_equal(ack_result.updates.size(), std::size_t {1}, "acknowledgement should emit one order update");
+    expect_equal(ack_result.updates[0].status, trading::core::OrderStatus::acknowledged, "acknowledgement status should match");
+
+    expect_true(partial_result.applied, "partial fill report should apply");
+    expect_equal(partial_result.updates[0].status, trading::core::OrderStatus::partially_filled, "partial status should match");
+    expect_equal(partial_result.fills.size(), std::size_t {1}, "partial fill should emit one fill");
+    expect_equal(partial_result.fills[0].quantity, 0.4, "partial fill delta should match cumulative change");
+
+    expect_true(final_result.applied, "final fill report should apply");
+    expect_equal(final_result.updates[0].status, trading::core::OrderStatus::filled, "final status should match");
+    expect_equal(final_result.fills.size(), std::size_t {1}, "final fill should emit one fill");
+    expect_equal(final_result.fills[0].quantity, 0.6, "final fill delta should be remaining quantity");
+
+    const auto order = tracker.get_order("live-order-1");
+    expect_true(order.has_value(), "tracked live order should exist");
+    expect_equal(order->status, trading::core::OrderStatus::filled, "tracked live order should reach filled");
+    expect_equal(order->filled_quantity, 1.0, "tracked filled quantity should match final cumulative quantity");
+}
+
+// Verifies duplicate execution reports are ignored idempotently.
+void test_live_execution_tracker_ignores_duplicate_reports() {
+    trading::execution::LiveExecutionTracker tracker;
+    const auto instrument = make_btc_instrument();
+
+    tracker.register_order(
+        {
+            .request_id = "req-1",
+            .strategy_id = "strategy-1",
+            .instrument = instrument,
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 1.0,
+            .price = 42000.0,
+        },
+        "live-order-1",
+        "live-client-1");
+
+    const auto first_result = tracker.apply_report({
+        .report_id = "report-dup-1",
+        .order_id = "live-order-1",
+        .client_order_id = "live-client-1",
+        .instrument = instrument,
+        .side = trading::core::OrderSide::buy,
+        .status = trading::core::OrderStatus::partially_filled,
+        .cumulative_filled_quantity = 0.5,
+        .last_fill_price = 42000.0,
+        .exchange_timestamp = 1000,
+    });
+    const auto duplicate_result = tracker.apply_report({
+        .report_id = "report-dup-1",
+        .order_id = "live-order-1",
+        .client_order_id = "live-client-1",
+        .instrument = instrument,
+        .side = trading::core::OrderSide::buy,
+        .status = trading::core::OrderStatus::partially_filled,
+        .cumulative_filled_quantity = 0.5,
+        .last_fill_price = 42000.0,
+        .exchange_timestamp = 1000,
+    });
+
+    expect_true(first_result.applied, "first report should apply");
+    expect_true(duplicate_result.ignored_duplicate, "duplicate report should be ignored");
+    expect_true(!duplicate_result.applied, "duplicate report should not apply twice");
+
+    const auto order = tracker.get_order("live-order-1");
+    expect_true(order.has_value(), "tracked order should still exist");
+    expect_equal(order->filled_quantity, 0.5, "duplicate report should not change filled quantity");
+}
+
+// Verifies late execution reports do not roll terminal local state backward.
+void test_live_execution_tracker_ignores_late_terminal_regressions() {
+    trading::execution::LiveExecutionTracker tracker;
+    const auto instrument = make_btc_instrument();
+
+    tracker.register_order(
+        {
+            .request_id = "req-1",
+            .strategy_id = "strategy-1",
+            .instrument = instrument,
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 1.0,
+            .price = 42000.0,
+        },
+        "live-order-1",
+        "live-client-1");
+
+    const auto final_apply = tracker.apply_report({
+        .report_id = "report-final-1",
+        .order_id = "live-order-1",
+        .client_order_id = "live-client-1",
+        .instrument = instrument,
+        .side = trading::core::OrderSide::buy,
+        .status = trading::core::OrderStatus::filled,
+        .cumulative_filled_quantity = 1.0,
+        .last_fill_price = 42000.0,
+        .exchange_timestamp = 2000,
+    });
+    expect_true(final_apply.applied, "terminal fill report should apply before late regression test");
+
+    const auto late_result = tracker.apply_report({
+        .report_id = "report-late-1",
+        .order_id = "live-order-1",
+        .client_order_id = "live-client-1",
+        .instrument = instrument,
+        .side = trading::core::OrderSide::buy,
+        .status = trading::core::OrderStatus::partially_filled,
+        .cumulative_filled_quantity = 0.4,
+        .last_fill_price = 41990.0,
+        .exchange_timestamp = 1500,
+    });
+
+    expect_true(late_result.ignored_stale, "late regressive report should be ignored");
+    const auto order = tracker.get_order("live-order-1");
+    expect_true(order.has_value(), "tracked order should still exist");
+    expect_equal(order->status, trading::core::OrderStatus::filled, "late report should not roll terminal state backward");
+    expect_equal(order->filled_quantity, 1.0, "late report should not reduce filled quantity");
 }
 
 // Verifies the first buy fill opens a long position and updates balances.
@@ -1844,6 +2018,31 @@ void test_exchange_adapter_stub_integration() {
     });
     expect_equal(submit_result.updates.size(), std::size_t {2}, "execution adapter should proxy simulator lifecycle events");
     expect_equal(submit_result.updates[0].status, trading::core::OrderStatus::acknowledged, "first update should acknowledge");
+
+    trading::exchange::MockLiveExchangeExecutionAdapter live_execution_adapter;
+    const auto live_submit = live_execution_adapter.submit({
+        .request_id = "req-live-1",
+        .strategy_id = "strategy-1",
+        .instrument = instrument,
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.25,
+        .price = 42010.0,
+    });
+    expect_equal(live_submit.updates.size(), std::size_t {1}, "live adapter submit should produce one pending update");
+    expect_equal(live_submit.updates[0].status, trading::core::OrderStatus::pending_submit, "live adapter should enter pending_submit before exchange ack");
+
+    const auto reconciliation = live_execution_adapter.apply_exchange_report({
+        .report_id = "live-report-1",
+        .order_id = live_submit.order_id,
+        .client_order_id = live_submit.client_order_id,
+        .instrument = instrument,
+        .side = trading::core::OrderSide::buy,
+        .status = trading::core::OrderStatus::acknowledged,
+        .cumulative_filled_quantity = 0.0,
+        .exchange_timestamp = 1000,
+    });
+    expect_true(reconciliation.applied, "live adapter should reconcile exchange acknowledgements");
 }
 
 // Verifies payload normalization keeps internal market-event semantics stable.
@@ -1911,6 +2110,9 @@ int main() {
         {"simulated_execution_engine_rejects_market_order", test_simulated_execution_engine_rejects_market_order},
         {"simulated_execution_engine_partial_then_full_fill", test_simulated_execution_engine_partial_then_full_fill},
         {"simulated_execution_engine_cancel_open_order", test_simulated_execution_engine_cancel_open_order},
+        {"live_execution_tracker_applies_full_lifecycle", test_live_execution_tracker_applies_full_lifecycle},
+        {"live_execution_tracker_ignores_duplicate_reports", test_live_execution_tracker_ignores_duplicate_reports},
+        {"live_execution_tracker_ignores_late_terminal_regressions", test_live_execution_tracker_ignores_late_terminal_regressions},
         {"portfolio_service_opens_position_from_first_fill", test_portfolio_service_opens_position_from_first_fill},
         {"portfolio_service_updates_average_entry_price", test_portfolio_service_updates_average_entry_price},
         {"portfolio_service_realized_pnl_on_position_reduction", test_portfolio_service_realized_pnl_on_position_reduction},
