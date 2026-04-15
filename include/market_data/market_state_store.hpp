@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace trading::market_data {
 
@@ -13,6 +14,8 @@ namespace trading::market_data {
 struct MarketState {
     std::optional<double> best_bid;
     std::optional<double> best_ask;
+    std::vector<trading::core::BookLevel> bid_levels;
+    std::vector<trading::core::BookLevel> ask_levels;
     std::optional<double> last_trade_price;
     std::optional<double> last_trade_quantity;
     std::int64_t last_exchange_timestamp {0};

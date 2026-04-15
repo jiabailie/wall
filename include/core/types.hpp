@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace trading::core {
 
@@ -51,6 +52,12 @@ struct Instrument {
     double lot_size {0.0};
 };
 
+// Stores one price level in a normalized order book.
+struct BookLevel {
+    double price {0.0};
+    double quantity {0.0};
+};
+
 // Stores one normalized inbound market event.
 struct MarketEvent {
     std::string event_id;
@@ -60,6 +67,8 @@ struct MarketEvent {
     double quantity {0.0};
     std::optional<double> bid_price;
     std::optional<double> ask_price;
+    std::vector<BookLevel> bid_levels;
+    std::vector<BookLevel> ask_levels;
     std::int64_t exchange_timestamp {0};
     std::int64_t receive_timestamp {0};
     std::int64_t process_timestamp {0};

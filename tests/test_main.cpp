@@ -8,6 +8,7 @@
 #include "core/event_dispatcher.hpp"
 #include "core/types.hpp"
 #include "exchange/exchange_execution_adapter.hpp"
+#include "exchange/live_market_data_feed.hpp"
 #include "exchange/exchange_market_data_adapter.hpp"
 #include "execution/live_execution_tracker.hpp"
 #include "execution/simulated_execution_engine.hpp"
@@ -18,6 +19,7 @@
 #include "ingestion/transaction_consumer.hpp"
 #include "ingestion/transaction_ingestor.hpp"
 #include "market_data/market_state_store.hpp"
+#include "market_data/feed_health_tracker.hpp"
 #include "monitoring/health_status.hpp"
 #include "monitoring/logger.hpp"
 #include "portfolio/portfolio_service.hpp"
@@ -476,6 +478,121 @@ void test_market_state_store_quote_update_preserves_trade_state() {
     expect_equal(*state->best_bid, 42040.0, "best bid should update from quote");
     expect_equal(*state->last_trade_price, 42050.0, "quote update should preserve prior trade price");
     expect_equal(*state->last_trade_quantity, 0.8, "quote update should preserve prior trade quantity");
+}
+
+// Verifies book snapshots populate richer depth state and best prices.
+void test_market_state_store_tracks_book_depth() {
+    trading::core::FixedClock clock(6000);
+    trading::market_data::MarketStateStore store(clock);
+    const auto instrument = make_btc_instrument();
+
+    store.apply(trading::core::MarketEvent {
+        .event_id = "book-1",
+        .type = trading::core::MarketEventType::book_snapshot,
+        .instrument = instrument,
+        .bid_levels = {
+            {.price = 42000.0, .quantity = 1.2},
+            {.price = 41999.5, .quantity = 2.0},
+        },
+        .ask_levels = {
+            {.price = 42001.0, .quantity = 1.4},
+            {.price = 42002.0, .quantity = 2.2},
+        },
+        .exchange_timestamp = 1000,
+        .receive_timestamp = 1100,
+        .process_timestamp = 1200,
+    });
+
+    const auto state = store.get(instrument.instrument_id);
+    expect_true(state.has_value(), "book state should exist");
+    expect_equal(state->bid_levels.size(), std::size_t {2}, "bid depth should be tracked");
+    expect_equal(state->ask_levels.size(), std::size_t {2}, "ask depth should be tracked");
+    expect_equal(*state->best_bid, 42000.0, "best bid should follow top depth level");
+    expect_equal(*state->best_ask, 42001.0, "best ask should follow top depth level");
+}
+
+// Verifies feed health degrades on stale data and disconnects beyond pure timestamp checks.
+void test_feed_health_tracker_detects_stale_and_disconnect_states() {
+    trading::core::FixedClock clock(1000);
+    trading::market_data::FeedHealthTracker tracker(clock);
+
+    expect_equal(
+        tracker.status(500, 200),
+        trading::monitoring::HealthStatus::unknown,
+        "brand-new tracker should be unknown");
+
+    tracker.on_connect();
+    expect_equal(
+        tracker.status(500, 200),
+        trading::monitoring::HealthStatus::degraded,
+        "connected but unsubscribed feed should be degraded");
+
+    tracker.on_subscribe_success();
+    tracker.on_message(1000);
+    expect_equal(
+        tracker.status(500, 200),
+        trading::monitoring::HealthStatus::healthy,
+        "fresh subscribed feed should be healthy");
+
+    clock.set_now_ms(1700);
+    expect_equal(
+        tracker.status(500, 200),
+        trading::monitoring::HealthStatus::degraded,
+        "stale feed should degrade before disconnect");
+
+    tracker.on_disconnect();
+    expect_equal(
+        tracker.status(500, 200),
+        trading::monitoring::HealthStatus::degraded,
+        "recent disconnect should degrade first");
+
+    clock.set_now_ms(2001);
+    expect_equal(
+        tracker.status(500, 200),
+        trading::monitoring::HealthStatus::unavailable,
+        "extended disconnect should become unavailable");
+}
+
+// Verifies the live feed controller reconnects and resubscribes after disconnects.
+void test_live_market_data_feed_controller_reconnects_and_resubscribes() {
+    trading::exchange::MockMarketDataFeedSession session;
+    trading::exchange::LiveMarketDataFeedController controller(
+        session,
+        {"BTCUSDT", "ETHUSDT"},
+        2);
+
+    controller.start();
+    expect_true(controller.connected(), "controller should be connected after start");
+    expect_equal(session.connect_calls(), std::size_t {1}, "start should connect once");
+    expect_equal(session.subscribe_calls(), std::size_t {1}, "start should subscribe once");
+    expect_equal(session.last_symbols().size(), std::size_t {2}, "subscription symbols should be forwarded");
+
+    controller.handle_disconnect();
+    expect_true(controller.connected(), "controller should reconnect after disconnect");
+    expect_equal(controller.reconnect_attempts(), std::size_t {1}, "disconnect should increment reconnect attempts");
+    expect_equal(session.disconnect_calls(), std::size_t {1}, "disconnect should be forwarded");
+    expect_equal(session.connect_calls(), std::size_t {2}, "reconnect should call connect again");
+    expect_equal(session.subscribe_calls(), std::size_t {2}, "reconnect should resubscribe");
+}
+
+// Verifies the live feed controller stops after exhausting reconnect attempts.
+void test_live_market_data_feed_controller_stops_after_retry_budget() {
+    trading::exchange::MockMarketDataFeedSession session;
+    trading::exchange::LiveMarketDataFeedController controller(
+        session,
+        {"BTCUSDT"},
+        0);
+
+    controller.start();
+
+    bool threw = false;
+    try {
+        controller.handle_disconnect();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+
+    expect_true(threw, "disconnect beyond retry budget should throw");
 }
 
 // Verifies the sample strategy emits a deterministic order when the threshold is crossed.
@@ -2099,6 +2216,10 @@ int main() {
         {"market_state_store", test_market_state_store},
         {"market_state_store_ignores_out_of_order_events", test_market_state_store_ignores_out_of_order_events},
         {"market_state_store_quote_update_preserves_trade_state", test_market_state_store_quote_update_preserves_trade_state},
+        {"market_state_store_tracks_book_depth", test_market_state_store_tracks_book_depth},
+        {"feed_health_tracker_detects_stale_and_disconnect_states", test_feed_health_tracker_detects_stale_and_disconnect_states},
+        {"live_market_data_feed_controller_reconnects_and_resubscribes", test_live_market_data_feed_controller_reconnects_and_resubscribes},
+        {"live_market_data_feed_controller_stops_after_retry_budget", test_live_market_data_feed_controller_stops_after_retry_budget},
         {"sample_threshold_strategy_emits_order_on_trigger", test_sample_threshold_strategy_emits_order_on_trigger},
         {"sample_threshold_strategy_no_order_without_trigger", test_sample_threshold_strategy_no_order_without_trigger},
         {"sample_threshold_strategy_reset_command", test_sample_threshold_strategy_reset_command},
