@@ -2,14 +2,16 @@
 #include "app/mock_event_sources.hpp"
 #include "app/recovery_service.hpp"
 #include "app/simulation_runtime.hpp"
+#include "app/backtest_runner.hpp"
 #include "app/transaction_publisher_application.hpp"
 #include "config/config_loader.hpp"
 #include "core/clock.hpp"
 #include "core/event_dispatcher.hpp"
 #include "core/types.hpp"
 #include "exchange/exchange_execution_adapter.hpp"
-#include "exchange/live_market_data_feed.hpp"
 #include "exchange/exchange_market_data_adapter.hpp"
+#include "exchange/exchange_router.hpp"
+#include "exchange/live_market_data_feed.hpp"
 #include "execution/live_execution_tracker.hpp"
 #include "execution/simulated_execution_engine.hpp"
 #include "infrastructure/postgres_repositories.hpp"
@@ -28,6 +30,8 @@
 #include "storage/storage_interfaces.hpp"
 #include "storage/replay_service.hpp"
 #include "strategy/sample_threshold_strategy.hpp"
+#include "strategy/spread_capture_strategy.hpp"
+#include "strategy/strategy_coordinator.hpp"
 
 #include <cstdlib>
 #include <functional>
@@ -38,6 +42,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -133,6 +138,21 @@ public:
     }
 };
 
+class ThrowingStrategy final : public trading::strategy::IStrategy {
+public:
+    explicit ThrowingStrategy(std::string strategy_id) : strategy_id_(std::move(strategy_id)) {}
+
+    std::string strategy_id() const override { return strategy_id_; }
+
+    std::vector<trading::core::OrderRequest> on_event(const trading::core::EngineEvent&,
+                                                      const trading::strategy::StrategyContext&) override {
+        throw std::runtime_error("strategy failure");
+    }
+
+private:
+    std::string strategy_id_;
+};
+
 // Returns a reusable BTC instrument fixture for tests.
 trading::core::Instrument make_btc_instrument() {
     return {
@@ -143,6 +163,18 @@ trading::core::Instrument make_btc_instrument() {
         .quote_asset = "USDT",
         .tick_size = 0.1,
         .lot_size = 0.0001,
+    };
+}
+
+trading::core::Instrument make_coinbase_eth_instrument() {
+    return {
+        .instrument_id = "coinbase:ETHUSD",
+        .exchange = "coinbase",
+        .symbol = "ETHUSD",
+        .base_asset = "ETH",
+        .quote_asset = "USD",
+        .tick_size = 0.01,
+        .lot_size = 0.001,
     };
 }
 
@@ -794,6 +826,58 @@ void test_sample_threshold_strategy_reset_command() {
     expect_true(second_requests.empty(), "strategy should suppress repeated signals before reset");
     expect_true(reset_requests.empty(), "reset command should not emit an order");
     expect_equal(third_requests.size(), std::size_t {1}, "strategy should emit again after reset");
+}
+
+// Verifies one failing strategy is paused without blocking healthy strategies in the same runtime.
+void test_strategy_coordinator_isolates_failing_strategy() {
+    trading::core::FixedClock clock(5000);
+    trading::market_data::MarketStateStore store(clock);
+    const auto instrument = make_btc_instrument();
+
+    store.apply(trading::core::MarketEvent {
+        .event_id = "market-1",
+        .type = trading::core::MarketEventType::trade,
+        .instrument = instrument,
+        .price = 41990.0,
+        .quantity = 0.5,
+        .process_timestamp = 4900,
+    });
+
+    trading::strategy::StrategyCoordinator coordinator;
+    coordinator.add_strategy(std::make_unique<trading::strategy::SampleThresholdStrategy>(
+        trading::strategy::SampleThresholdStrategyConfig {
+            .strategy_id = "threshold-1",
+            .instrument_id = instrument.instrument_id,
+            .instrument = instrument,
+            .trigger_price = 42000.0,
+            .order_quantity = 0.25,
+            .side = trading::core::OrderSide::buy,
+        }));
+    coordinator.add_strategy(std::make_unique<ThrowingStrategy>("failing-1"));
+
+    const trading::strategy::StrategyContext context {
+        .market_state_store = store,
+        .clock = clock,
+    };
+    const trading::core::MarketEvent event {
+        .event_id = "market-2",
+        .type = trading::core::MarketEventType::trade,
+        .instrument = instrument,
+        .price = 41990.0,
+        .quantity = 0.5,
+        .process_timestamp = 4950,
+    };
+
+    const auto requests = coordinator.on_event(event, context);
+
+    expect_equal(requests.size(), std::size_t {1}, "healthy strategy should still emit when another strategy fails");
+    expect_equal(coordinator.strategy_count(), std::size_t {2}, "both strategies should remain registered");
+    expect_equal(coordinator.active_strategy_count(), std::size_t {1}, "failing strategy should be paused");
+    expect_true(coordinator.is_paused("failing-1"), "failing strategy should be marked paused");
+
+    const auto stats = coordinator.all_stats();
+    expect_equal(stats.size(), std::size_t {2}, "stats should be present for both strategies");
+    expect_true(stats[1].failures == 1 || stats[0].failures == 1, "one strategy should record a failure");
 }
 
 // Verifies valid orders pass baseline risk checks.
@@ -2186,6 +2270,75 @@ void test_replay_service_isolated_from_live_clock() {
     std::filesystem::remove_all(temp_dir);
 }
 
+// Verifies the backtest runner returns replay, strategy, and PnL summary data.
+void test_backtest_runner_summarizes_runtime_results() {
+    const auto temp_dir = make_temp_directory("backtest-summary");
+    const auto log_path = temp_dir / "events.tsv";
+    trading::storage::ReplayService replay_service(log_path);
+    replay_service.reset_log();
+
+    replay_service.append_event(trading::core::MarketEvent {
+        .event_id = "event-1",
+        .type = trading::core::MarketEventType::trade,
+        .instrument = make_btc_instrument(),
+        .price = 41990.0,
+        .quantity = 0.5,
+        .process_timestamp = 1000,
+    });
+
+    auto coordinator = std::make_shared<trading::strategy::StrategyCoordinator>();
+    coordinator->add_strategy(std::make_unique<trading::strategy::SampleThresholdStrategy>(
+        trading::strategy::SampleThresholdStrategyConfig {
+            .strategy_id = "threshold-1",
+            .instrument_id = "binance:BTCUSDT",
+            .instrument = make_btc_instrument(),
+            .trigger_price = 42000.0,
+            .order_quantity = 0.05,
+            .side = trading::core::OrderSide::buy,
+        }));
+
+    trading::core::FixedClock clock(5000);
+    trading::app::SimulationRuntime runtime(
+        clock,
+        {
+            .max_order_quantity = 1.0,
+            .max_order_notional = 50000.0,
+            .max_position_quantity = 2.0,
+            .stale_after_ms = 10000,
+            .kill_switch_enabled = false,
+        },
+        {
+            .strategy = {
+                .strategy_id = "threshold-1",
+                .instrument_id = "binance:BTCUSDT",
+                .trigger_price = 42000.0,
+                .order_quantity = 0.05,
+                .side = trading::core::OrderSide::buy,
+            },
+            .strategy_coordinator = coordinator,
+            .execution = {
+                .partial_fill_threshold = 1.0,
+                .partial_fill_ratio = 0.5,
+            },
+            .auto_complete_partial_fills = false,
+        });
+
+    trading::app::BacktestRunner runner(log_path);
+    const auto summary = runner.run(runtime);
+
+    expect_equal(summary.replay_stats.replayed_records, std::size_t {1}, "backtest should replay the market event");
+    expect_equal(summary.configured_strategies, std::size_t {1}, "configured strategy count should be reported");
+    expect_equal(summary.active_strategies, std::size_t {1}, "healthy strategy should remain active");
+    expect_equal(summary.paused_strategies, std::size_t {0}, "no strategy should be paused");
+    expect_equal(summary.risk_approved, std::size_t {1}, "threshold event should produce one approved request");
+    expect_equal(summary.fills_applied, std::size_t {1}, "backtest should apply one fill");
+    expect_true(summary.total_unrealized_pnl == 0.0, "new fill at mark price should have zero unrealized pnl");
+    expect_equal(summary.strategy_stats.size(), std::size_t {1}, "summary should expose strategy stats");
+    expect_equal(summary.strategy_stats[0].emitted_requests, std::size_t {1}, "strategy stats should include emitted request count");
+
+    std::filesystem::remove_all(temp_dir);
+}
+
 // Verifies raw Kafka payloads are adapted into normalized transaction commands.
 void test_kafka_transaction_consumer_parses_payload() {
     FakeKafkaConsumerClient fake_client({
@@ -2509,6 +2662,66 @@ void test_exchange_adapter_stub_integration() {
     expect_true(reconciliation.applied, "live adapter should reconcile exchange acknowledgements");
 }
 
+// Verifies market-data and execution routing resolve adapters by exchange name.
+void test_exchange_router_routes_multi_exchange_requests() {
+    trading::exchange::ExchangeMarketDataRouter market_router;
+    market_router.register_adapter(
+        "binance",
+        std::make_unique<trading::exchange::MockExchangeMarketDataAdapter>(make_btc_instrument()));
+    market_router.register_adapter(
+        "coinbase",
+        std::make_unique<trading::exchange::MockExchangeMarketDataAdapter>(make_coinbase_eth_instrument()));
+
+    const auto binance_event = market_router.normalize(
+        "binance",
+        "type=trade;event_id=fixture-1;symbol=BTCUSDT;price=42010.5;quantity=0.75;exchange_ts=123456",
+        123500,
+        123501);
+    const auto* normalized_binance_event = std::get_if<trading::core::MarketEvent>(&binance_event);
+    expect_true(normalized_binance_event != nullptr, "registered exchange should normalize market payload");
+    expect_equal(normalized_binance_event->instrument.exchange, std::string("binance"), "normalized event should keep binance identity");
+
+    const auto missing_market = market_router.normalize("kraken", "type=trade", 1, 1);
+    const auto* missing_market_error = std::get_if<trading::exchange::ExchangeAdapterError>(&missing_market);
+    expect_true(missing_market_error != nullptr, "unknown market exchange should return an adapter error");
+
+    trading::exchange::ExchangeExecutionRouter execution_router;
+    execution_router.register_adapter(
+        "binance",
+        std::make_unique<trading::exchange::SimulatedExchangeExecutionAdapter>(
+            trading::execution::SimulatedExecutionConfig {
+                .partial_fill_threshold = 1.0,
+                .partial_fill_ratio = 0.5,
+            }));
+
+    const auto routed_submit = execution_router.submit({
+        .request_id = "req-1",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.25,
+        .price = 42010.0,
+    });
+    expect_equal(routed_submit.updates.size(), std::size_t {2}, "registered execution adapter should receive routed submit");
+
+    const auto missing_submit = execution_router.submit({
+        .request_id = "req-2",
+        .strategy_id = "strategy-2",
+        .instrument = make_coinbase_eth_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.25,
+        .price = 3000.0,
+    });
+    expect_equal(missing_submit.updates.size(), std::size_t {1}, "missing execution route should return one rejection update");
+    expect_equal(missing_submit.updates[0].status, trading::core::OrderStatus::rejected, "missing execution route should reject");
+
+    const auto capabilities = execution_router.capabilities("binance");
+    expect_true(capabilities.has_value(), "registered execution route should expose capabilities");
+    expect_true(capabilities->supports_cancel, "simulated execution route should support cancel");
+}
+
 // Verifies payload normalization keeps internal market-event semantics stable.
 void test_exchange_market_payload_normalization_contract() {
     trading::exchange::MockExchangeMarketDataAdapter market_adapter(make_btc_instrument());
@@ -2571,6 +2784,7 @@ int main() {
         {"sample_threshold_strategy_emits_order_on_trigger", test_sample_threshold_strategy_emits_order_on_trigger},
         {"sample_threshold_strategy_no_order_without_trigger", test_sample_threshold_strategy_no_order_without_trigger},
         {"sample_threshold_strategy_reset_command", test_sample_threshold_strategy_reset_command},
+        {"strategy_coordinator_isolates_failing_strategy", test_strategy_coordinator_isolates_failing_strategy},
         {"risk_engine_approves_valid_order", test_risk_engine_approves_valid_order},
         {"risk_engine_rejects_oversize_order", test_risk_engine_rejects_oversize_order},
         {"risk_engine_rejects_stale_market", test_risk_engine_rejects_stale_market},
@@ -2608,6 +2822,7 @@ int main() {
         {"replay_service_reproduces_fixed_session_state", test_replay_service_reproduces_fixed_session_state},
         {"replay_service_skips_invalid_records", test_replay_service_skips_invalid_records},
         {"replay_service_isolated_from_live_clock", test_replay_service_isolated_from_live_clock},
+        {"backtest_runner_summarizes_runtime_results", test_backtest_runner_summarizes_runtime_results},
         {"kafka_transaction_consumer_parses_payload", test_kafka_transaction_consumer_parses_payload},
         {"kafka_transaction_consumer_skips_malformed_messages", test_kafka_transaction_consumer_skips_malformed_messages},
         {"kafka_transaction_consumer_skips_malformed_payload_burst", test_kafka_transaction_consumer_skips_malformed_payload_burst},
@@ -2620,6 +2835,7 @@ int main() {
         {"transaction_ingestor_records_metrics", test_transaction_ingestor_records_metrics},
         {"transaction_ingestor_counts_persistence_failures", test_transaction_ingestor_counts_persistence_failures},
         {"exchange_adapter_stub_integration", test_exchange_adapter_stub_integration},
+        {"exchange_router_routes_multi_exchange_requests", test_exchange_router_routes_multi_exchange_requests},
         {"exchange_market_payload_normalization_contract", test_exchange_market_payload_normalization_contract},
         {"exchange_error_mapping_behavior", test_exchange_error_mapping_behavior},
     };

@@ -27,6 +27,7 @@ endif()
 
 add_library(trading_engine
     src/app/application.cpp
+    src/app/backtest_runner.cpp
     src/app/engine_controller.cpp
     src/app/mock_event_sources.cpp
     src/app/recovery_service.cpp
@@ -35,6 +36,7 @@ add_library(trading_engine
     src/config/config_loader.cpp
     src/exchange/exchange_execution_adapter.cpp
     src/exchange/exchange_market_data_adapter.cpp
+    src/exchange/exchange_router.cpp
     src/exchange/live_market_data_feed.cpp
     src/execution/live_execution_tracker.cpp
     src/execution/simulated_execution_engine.cpp
@@ -54,6 +56,8 @@ add_library(trading_engine
     src/storage/replay_service.cpp
     src/storage/storage_interfaces.cpp
     src/strategy/sample_threshold_strategy.cpp
+    src/strategy/spread_capture_strategy.cpp
+    src/strategy/strategy_coordinator.cpp
 )
 
 target_include_directories(trading_engine
@@ -86,6 +90,9 @@ target_link_libraries(wall_replay PRIVATE trading_engine)
 
 add_executable(wall_tx_producer src/tools/transaction_producer_main.cpp)
 target_link_libraries(wall_tx_producer PRIVATE trading_engine)
+
+add_executable(wall_backtest src/tools/backtest_main.cpp)
+target_link_libraries(wall_backtest PRIVATE trading_engine)
 
 enable_testing()
 add_test(NAME wall_tests COMMAND wall_tests)

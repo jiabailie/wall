@@ -10,14 +10,17 @@
 #include "portfolio/portfolio_service.hpp"
 #include "risk/risk_engine.hpp"
 #include "strategy/sample_threshold_strategy.hpp"
+#include "strategy/strategy_coordinator.hpp"
 
 #include <cstddef>
+#include <memory>
 
 namespace trading::app {
 
 // Stores configurable behavior for end-to-end in-process simulation.
 struct SimulationRuntimeConfig {
     trading::strategy::SampleThresholdStrategyConfig strategy;
+    std::shared_ptr<trading::strategy::StrategyCoordinator> strategy_coordinator;
     trading::execution::SimulatedExecutionConfig execution;
     bool auto_complete_partial_fills {false};
 };
@@ -46,6 +49,21 @@ public:
     // Returns total applied fill count since startup.
     [[nodiscard]] std::size_t applied_fill_count() const { return applied_fill_count_; }
 
+    // Returns current orchestration stats for all configured strategies.
+    [[nodiscard]] std::vector<trading::strategy::StrategyRuntimeStats> strategy_stats() const {
+        return strategy_coordinator_ != nullptr ? strategy_coordinator_->all_stats() : std::vector<trading::strategy::StrategyRuntimeStats> {};
+    }
+
+    // Returns the number of currently active strategy instances.
+    [[nodiscard]] std::size_t active_strategy_count() const {
+        return strategy_coordinator_ != nullptr ? strategy_coordinator_->active_strategy_count() : 0;
+    }
+
+    // Returns the total number of configured strategy instances.
+    [[nodiscard]] std::size_t strategy_count() const {
+        return strategy_coordinator_ != nullptr ? strategy_coordinator_->strategy_count() : 0;
+    }
+
     // Restores one persisted open order into the execution engine for startup recovery.
     void restore_open_order(const trading::storage::OrderRecord& order);
 
@@ -67,7 +85,7 @@ private:
 
     const trading::core::IClock& clock_;
     trading::market_data::MarketStateStore market_state_store_;
-    trading::strategy::SampleThresholdStrategy strategy_;
+    std::shared_ptr<trading::strategy::StrategyCoordinator> strategy_coordinator_;
     trading::strategy::StrategyContext strategy_context_;
     trading::risk::RiskEngine risk_engine_;
     trading::portfolio::PortfolioService portfolio_service_;

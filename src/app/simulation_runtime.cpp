@@ -1,6 +1,7 @@
 #include "app/simulation_runtime.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <variant>
 
 namespace trading::app {
@@ -12,7 +13,7 @@ SimulationRuntime::SimulationRuntime(const trading::core::IClock& clock,
                                      trading::monitoring::IMetricsCollector* metrics)
     : clock_(clock),
       market_state_store_(clock),
-      strategy_(std::move(runtime_config.strategy)),
+      strategy_coordinator_(runtime_config.strategy_coordinator),
       strategy_context_({
           .market_state_store = market_state_store_,
           .clock = clock,
@@ -21,7 +22,13 @@ SimulationRuntime::SimulationRuntime(const trading::core::IClock& clock,
       execution_engine_(runtime_config.execution),
       controls_(controls),
       metrics_(metrics),
-      auto_complete_partial_fills_(runtime_config.auto_complete_partial_fills) {}
+      auto_complete_partial_fills_(runtime_config.auto_complete_partial_fills) {
+    if (strategy_coordinator_ == nullptr) {
+        strategy_coordinator_ = std::make_shared<trading::strategy::StrategyCoordinator>();
+        strategy_coordinator_->add_strategy(
+            std::make_unique<trading::strategy::SampleThresholdStrategy>(std::move(runtime_config.strategy)));
+    }
+}
 
 // Handles one incoming engine event through market, strategy, risk, execution, and portfolio.
 void SimulationRuntime::on_event(const trading::core::EngineEvent& event) {
@@ -33,7 +40,7 @@ void SimulationRuntime::on_event(const trading::core::EngineEvent& event) {
         }
     }
 
-    const auto requests = strategy_.on_event(event, strategy_context_);
+    const auto requests = strategy_coordinator_->on_event(event, strategy_context_);
     for (const auto& request : requests) {
         const auto request_started_ms = clock_.now_ms();
         if (controls_ != nullptr && controls_->trading_paused()) {

@@ -1,13 +1,13 @@
-#include "app/simulation_runtime.hpp"
+#include "app/backtest_runner.hpp"
 #include "config/config_loader.hpp"
 #include "core/clock.hpp"
-#include "storage/replay_service.hpp"
 #include "strategy/sample_threshold_strategy.hpp"
 #include "strategy/spread_capture_strategy.hpp"
 #include "strategy/strategy_coordinator.hpp"
 
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -57,7 +57,6 @@ std::shared_ptr<trading::strategy::StrategyCoordinator> build_strategy_coordinat
 
 }  // namespace
 
-// Replays a persisted event session into the simulation runtime.
 int main(int argc, char** argv) {
     try {
         trading::config::ConfigLoader loader;
@@ -71,9 +70,9 @@ int main(int argc, char** argv) {
             ? std::filesystem::path(argv[1])
             : (std::filesystem::temp_directory_path() / "wall-runtime-events.tsv");
 
-        trading::core::FixedClock replay_clock(0);
+        trading::core::FixedClock clock(0);
         trading::app::SimulationRuntime runtime(
-            replay_clock,
+            clock,
             config.risk,
             {
                 .strategy = {
@@ -91,24 +90,28 @@ int main(int argc, char** argv) {
                 .auto_complete_partial_fills = config.simulation.auto_complete_partial_fills,
             });
 
-        trading::storage::ReplayService replay_service(log_path);
-        const auto stats = replay_service.replay([&runtime](const trading::core::EngineEvent& event) {
-            runtime.on_event(event);
-        });
-
+        trading::app::BacktestRunner runner(log_path);
+        const auto summary = runner.run(runtime);
         std::cout
-            << "Replay complete"
+            << "Backtest complete"
             << " log_path=" << log_path.string()
-            << " total_records=" << stats.total_records
-            << " replayed_records=" << stats.replayed_records
-            << " skipped_records=" << stats.skipped_records
-            << " risk_approved=" << runtime.risk_approved_count()
-            << " risk_rejected=" << runtime.risk_rejected_count()
-            << " fills_applied=" << runtime.applied_fill_count()
+            << " total_records=" << summary.replay_stats.total_records
+            << " replayed_records=" << summary.replay_stats.replayed_records
+            << " skipped_records=" << summary.replay_stats.skipped_records
+            << " configured_strategies=" << summary.configured_strategies
+            << " active_strategies=" << summary.active_strategies
+            << " paused_strategies=" << summary.paused_strategies
+            << " strategy_failures=" << summary.strategy_failures
+            << " risk_approved=" << summary.risk_approved
+            << " risk_rejected=" << summary.risk_rejected
+            << " fills_applied=" << summary.fills_applied
+            << " resulting_positions=" << summary.resulting_positions
+            << " total_realized_pnl=" << summary.total_realized_pnl
+            << " total_unrealized_pnl=" << summary.total_unrealized_pnl
             << '\n';
         return 0;
     } catch (const std::exception& exception) {
-        std::cerr << "Replay failed: " << exception.what() << '\n';
+        std::cerr << "Backtest failed: " << exception.what() << '\n';
         return 1;
     }
 }
