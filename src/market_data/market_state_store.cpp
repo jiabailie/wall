@@ -18,6 +18,14 @@ void MarketStateStore::apply(const trading::core::MarketEvent& event) {
     if (event.ask_price.has_value()) {
         state.best_ask = event.ask_price;
     }
+    if (!event.bid_levels.empty()) {
+        state.bid_levels = event.bid_levels;
+        state.best_bid = event.bid_levels.front().price;
+    }
+    if (!event.ask_levels.empty()) {
+        state.ask_levels = event.ask_levels;
+        state.best_ask = event.ask_levels.front().price;
+    }
 
     // Step 3: Update the last trade view when quantity and price are present.
     if (event.quantity > 0.0 && event.price > 0.0) {
