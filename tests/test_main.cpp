@@ -1,5 +1,6 @@
 #include "app/engine_controller.hpp"
 #include "app/mock_event_sources.hpp"
+#include "app/recovery_service.hpp"
 #include "app/simulation_runtime.hpp"
 #include "app/transaction_publisher_application.hpp"
 #include "config/config_loader.hpp"
@@ -72,11 +73,22 @@ public:
         });
     }
 
+    void seek(const std::string& topic, int partition, std::int64_t next_offset) override {
+        seeks_.push_back({
+            .topic = topic,
+            .partition = partition,
+            .offset = next_offset,
+            .payload = "",
+        });
+    }
+
     [[nodiscard]] const std::vector<trading::infrastructure::RawKafkaMessage>& commits() const { return commits_; }
+    [[nodiscard]] const std::vector<trading::infrastructure::RawKafkaMessage>& seeks() const { return seeks_; }
 
 private:
     std::vector<trading::infrastructure::RawKafkaMessage> messages_;
     std::vector<trading::infrastructure::RawKafkaMessage> commits_;
+    std::vector<trading::infrastructure::RawKafkaMessage> seeks_;
     std::size_t next_index_ {0};
 };
 
@@ -1270,6 +1282,171 @@ void test_postgres_transaction_checkpoint_persistence() {
     std::filesystem::remove_all(temp_dir);
 }
 
+// Verifies balance snapshots persist across repository restarts.
+void test_postgres_balance_repository_write_read() {
+    const auto temp_dir = make_temp_directory("postgres-balance-repo");
+    {
+        trading::infrastructure::PostgresBalanceRepository repository(temp_dir);
+        repository.save_balance({
+            .asset = "USDT",
+            .total_balance = 10500.5,
+            .available_balance = 10400.25,
+        });
+    }
+    {
+        trading::infrastructure::PostgresBalanceRepository repository(temp_dir);
+        const auto balance = repository.get_balance("USDT");
+        expect_true(balance.has_value(), "balance snapshot should persist");
+        expect_equal(balance->total_balance, 10500.5, "persisted balance total should reload");
+        expect_equal(balance->available_balance, 10400.25, "persisted balance available should reload");
+    }
+    std::filesystem::remove_all(temp_dir);
+}
+
+// Verifies recovery rebuilds runtime state, warms cache, and derives Kafka checkpoints.
+void test_recovery_service_restores_runtime_and_cache() {
+    trading::storage::InMemoryTransactionRepository transaction_repository;
+    trading::storage::InMemoryOrderRepository order_repository;
+    trading::storage::InMemoryPositionRepository position_repository;
+    trading::storage::InMemoryBalanceRepository balance_repository;
+    trading::storage::InMemoryMarketStateCache market_cache;
+    trading::storage::InMemoryTransactionCache transaction_cache;
+
+    auto tx_1 = make_transaction("tx-1", 10);
+    auto tx_2 = make_transaction("tx-2", 12);
+    transaction_repository.save_received(tx_1);
+    transaction_repository.save_processed("tx-1", "processed");
+    transaction_repository.save_received(tx_2);
+    transaction_repository.save_processed("tx-2", "processed");
+
+    order_repository.save_order(
+        {
+            .request_id = "req-1",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.5,
+            .price = 42000.0,
+        },
+        "order-open-1",
+        "client-1");
+    order_repository.save_order_update({
+        .order_id = "order-open-1",
+        .client_order_id = "client-1",
+        .status = trading::core::OrderStatus::partially_filled,
+        .filled_quantity = 0.2,
+        .reason = std::nullopt,
+    });
+
+    position_repository.save_position({
+        .position_id = "position-binance:BTCUSDT",
+        .instrument = make_btc_instrument(),
+        .net_quantity = 0.2,
+        .average_entry_price = 42000.0,
+        .realized_pnl = 15.0,
+        .unrealized_pnl = 0.0,
+    });
+    balance_repository.save_balance({
+        .asset = "USDT",
+        .total_balance = 5000.0,
+        .available_balance = 4900.0,
+    });
+
+    trading::app::RecoveryService recovery_service(
+        transaction_repository,
+        order_repository,
+        position_repository,
+        balance_repository,
+        market_cache,
+        transaction_cache);
+
+    const auto snapshot = recovery_service.recover({
+        {
+            .instrument_id = "binance:BTCUSDT",
+            .best_bid = 41995.0,
+            .best_ask = 42005.0,
+            .last_trade_price = 42000.0,
+            .last_trade_quantity = 0.25,
+            .last_process_timestamp = 5000,
+        },
+    });
+
+    expect_equal(snapshot.open_orders.size(), std::size_t {1}, "one open order should be recovered");
+    expect_equal(snapshot.positions.size(), std::size_t {1}, "one position should be recovered");
+    expect_equal(snapshot.balances.size(), std::size_t {1}, "one balance should be recovered");
+    expect_equal(snapshot.kafka_checkpoints.size(), std::size_t {1}, "one partition checkpoint should be derived");
+    expect_equal(snapshot.kafka_checkpoints[0].offset, std::int64_t {12}, "latest processed offset should be recovered");
+    expect_equal(transaction_cache.get_status("tx-2"), std::string("processed"), "transaction cache should be warmed");
+
+    trading::core::FixedClock clock(5000);
+    trading::app::SimulationRuntime runtime(
+        clock,
+        {
+            .max_order_quantity = 1.0,
+            .max_order_notional = 50000.0,
+            .max_position_quantity = 2.0,
+            .stale_after_ms = 1000,
+            .kill_switch_enabled = false,
+        },
+        {
+            .strategy = {
+                .strategy_id = "threshold-1",
+                .instrument_id = "binance:BTCUSDT",
+                .trigger_price = 42000.0,
+                .order_quantity = 0.05,
+                .side = trading::core::OrderSide::buy,
+            },
+            .execution = {
+                .partial_fill_threshold = 1.0,
+                .partial_fill_ratio = 0.5,
+            },
+            .auto_complete_partial_fills = false,
+        });
+    recovery_service.restore_runtime(snapshot, runtime);
+
+    const auto position = runtime.portfolio().get_position("binance:BTCUSDT");
+    const auto balance = runtime.portfolio().get_balance("USDT");
+    expect_true(position.has_value(), "recovered runtime should restore position");
+    expect_equal(position->net_quantity, 0.2, "recovered position quantity should match");
+    expect_equal(balance.total_balance, 5000.0, "recovered balance should match");
+
+    const auto warmed_snapshot = market_cache.get_snapshot("binance:BTCUSDT");
+    expect_true(warmed_snapshot.has_value(), "market cache should be warmed from exchange snapshot");
+    expect_equal(*warmed_snapshot->best_bid, 41995.0, "warmed best bid should match exchange snapshot");
+}
+
+// Verifies Kafka recovery resumes from the next intended offset.
+void test_recovery_service_resumes_kafka_from_next_offset() {
+    trading::storage::InMemoryTransactionRepository transaction_repository;
+    trading::storage::InMemoryOrderRepository order_repository;
+    trading::storage::InMemoryPositionRepository position_repository;
+    trading::storage::InMemoryBalanceRepository balance_repository;
+    trading::storage::InMemoryMarketStateCache market_cache;
+    trading::storage::InMemoryTransactionCache transaction_cache;
+
+    auto tx = make_transaction("tx-1", 77);
+    tx.kafka_partition = 2;
+    transaction_repository.save_received(tx);
+    transaction_repository.save_processed("tx-1", "processed");
+
+    trading::app::RecoveryService recovery_service(
+        transaction_repository,
+        order_repository,
+        position_repository,
+        balance_repository,
+        market_cache,
+        transaction_cache);
+    const auto snapshot = recovery_service.recover();
+
+    FakeKafkaConsumerClient kafka_client({});
+    recovery_service.resume_kafka(snapshot, kafka_client);
+
+    expect_equal(kafka_client.seeks().size(), std::size_t {1}, "one kafka partition should be resumed");
+    expect_equal(kafka_client.seeks()[0].partition, 2, "recovery should resume the recovered partition");
+    expect_equal(kafka_client.seeks()[0].offset, std::int64_t {78}, "recovery should seek to the next offset");
+}
+
 // Verifies replay reproduces the same state as direct fixed-session processing.
 void test_replay_service_reproduces_fixed_session_state() {
     const auto temp_dir = make_temp_directory("replay-fixed-session");
@@ -1748,6 +1925,9 @@ int main() {
         {"postgres_order_repository_write_read", test_postgres_order_repository_write_read},
         {"redis_cache_adapters_write_read", test_redis_cache_adapters_write_read},
         {"postgres_transaction_checkpoint_persistence", test_postgres_transaction_checkpoint_persistence},
+        {"postgres_balance_repository_write_read", test_postgres_balance_repository_write_read},
+        {"recovery_service_restores_runtime_and_cache", test_recovery_service_restores_runtime_and_cache},
+        {"recovery_service_resumes_kafka_from_next_offset", test_recovery_service_resumes_kafka_from_next_offset},
         {"replay_service_reproduces_fixed_session_state", test_replay_service_reproduces_fixed_session_state},
         {"replay_service_skips_invalid_records", test_replay_service_skips_invalid_records},
         {"replay_service_isolated_from_live_clock", test_replay_service_isolated_from_live_clock},

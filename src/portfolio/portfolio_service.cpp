@@ -47,6 +47,34 @@ void PortfolioService::set_mark_price(const std::string& instrument_id, const do
     }
 }
 
+void PortfolioService::restore_position(const trading::core::Position& position) {
+    positions_[position.instrument.instrument_id] = position;
+}
+
+void PortfolioService::restore_balance(const trading::core::BalanceSnapshot& balance) {
+    balances_[balance.asset] = balance;
+}
+
+std::vector<trading::core::Position> PortfolioService::all_positions() const {
+    std::vector<trading::core::Position> positions;
+    positions.reserve(positions_.size());
+    for (const auto& [_, position] : positions_) {
+        positions.push_back(position);
+    }
+
+    return positions;
+}
+
+std::vector<trading::core::BalanceSnapshot> PortfolioService::all_balances() const {
+    std::vector<trading::core::BalanceSnapshot> balances;
+    balances.reserve(balances_.size());
+    for (const auto& [_, balance] : balances_) {
+        balances.push_back(balance);
+    }
+
+    return balances;
+}
+
 // Returns the sign of the provided value.
 double PortfolioService::sign(const double value) {
     if (value > 0.0) {

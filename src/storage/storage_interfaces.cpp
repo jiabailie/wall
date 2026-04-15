@@ -34,6 +34,10 @@ void InMemoryTransactionRepository::save_processed(const std::string& transactio
     });
 }
 
+std::vector<TransactionRecord> InMemoryTransactionRepository::all_records() const {
+    return records_;
+}
+
 // Stores the latest transaction status in insertion order.
 void InMemoryTransactionCache::set_status(const std::string& transaction_id, const std::string& status) {
     // Step 1: Update the existing entry when it already exists.
@@ -105,6 +109,25 @@ std::optional<OrderRecord> InMemoryOrderRepository::get_order(const std::string&
     return std::nullopt;
 }
 
+std::vector<OrderRecord> InMemoryOrderRepository::all_open_orders() const {
+    std::vector<OrderRecord> open_orders;
+    for (const auto& [_, order] : orders_) {
+        switch (order.status) {
+            case trading::core::OrderStatus::created:
+            case trading::core::OrderStatus::pending_submit:
+            case trading::core::OrderStatus::acknowledged:
+            case trading::core::OrderStatus::partially_filled:
+            case trading::core::OrderStatus::pending_cancel:
+                open_orders.push_back(order);
+                break;
+            default:
+                break;
+        }
+    }
+
+    return open_orders;
+}
+
 // Appends one fill record in insertion order.
 void InMemoryFillRepository::append_fill(const trading::core::FillEvent& fill) {
     fills_.push_back(fill);
@@ -127,6 +150,38 @@ std::optional<trading::core::Position> InMemoryPositionRepository::get_position(
     }
 
     return std::nullopt;
+}
+
+std::vector<trading::core::Position> InMemoryPositionRepository::all_positions() const {
+    std::vector<trading::core::Position> positions;
+    positions.reserve(positions_.size());
+    for (const auto& [_, position] : positions_) {
+        positions.push_back(position);
+    }
+
+    return positions;
+}
+
+void InMemoryBalanceRepository::save_balance(const trading::core::BalanceSnapshot& balance) {
+    balances_[balance.asset] = balance;
+}
+
+std::optional<trading::core::BalanceSnapshot> InMemoryBalanceRepository::get_balance(const std::string& asset) const {
+    if (const auto iterator = balances_.find(asset); iterator != balances_.end()) {
+        return iterator->second;
+    }
+
+    return std::nullopt;
+}
+
+std::vector<trading::core::BalanceSnapshot> InMemoryBalanceRepository::all_balances() const {
+    std::vector<trading::core::BalanceSnapshot> balances;
+    balances.reserve(balances_.size());
+    for (const auto& [_, balance] : balances_) {
+        balances.push_back(balance);
+    }
+
+    return balances;
 }
 
 // Stores or replaces the latest market snapshot for one instrument.

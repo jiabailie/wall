@@ -18,6 +18,13 @@ struct TransactionRecord {
     std::int64_t kafka_offset {0};
 };
 
+// Stores one restart checkpoint per Kafka topic partition.
+struct KafkaCheckpoint {
+    std::string topic;
+    int partition {0};
+    std::int64_t offset {0};
+};
+
 // Stores one persisted order record.
 struct OrderRecord {
     std::string order_id;
@@ -52,6 +59,9 @@ public:
 
     // Persists the final processing status after engine handling completes.
     virtual void save_processed(const std::string& transaction_id, const std::string& status) = 0;
+
+    // Returns all durable transaction-processing records.
+    [[nodiscard]] virtual std::vector<TransactionRecord> all_records() const = 0;
 };
 
 // Defines the cache boundary for hot transaction state.
@@ -78,6 +88,9 @@ public:
 
     // Returns the latest stored order record, if available.
     [[nodiscard]] virtual std::optional<OrderRecord> get_order(const std::string& order_id) const = 0;
+
+    // Returns all currently open orders that require runtime recovery.
+    [[nodiscard]] virtual std::vector<OrderRecord> all_open_orders() const = 0;
 };
 
 // Defines the durable repository boundary for fill records.
@@ -102,6 +115,24 @@ public:
 
     // Returns the latest stored position for the instrument, if available.
     [[nodiscard]] virtual std::optional<trading::core::Position> get_position(const std::string& instrument_id) const = 0;
+
+    // Returns all durable positions.
+    [[nodiscard]] virtual std::vector<trading::core::Position> all_positions() const = 0;
+};
+
+// Defines the durable repository boundary for balance snapshots.
+class IBalanceRepository {
+public:
+    virtual ~IBalanceRepository() = default;
+
+    // Persists the latest balance snapshot for one asset.
+    virtual void save_balance(const trading::core::BalanceSnapshot& balance) = 0;
+
+    // Returns the latest stored balance for the asset, if available.
+    [[nodiscard]] virtual std::optional<trading::core::BalanceSnapshot> get_balance(const std::string& asset) const = 0;
+
+    // Returns all durable balance snapshots.
+    [[nodiscard]] virtual std::vector<trading::core::BalanceSnapshot> all_balances() const = 0;
 };
 
 // Defines the cache boundary for market snapshots.
@@ -124,6 +155,8 @@ public:
 
     // Updates the status of an existing transaction record in memory.
     void save_processed(const std::string& transaction_id, const std::string& status) override;
+
+    [[nodiscard]] std::vector<TransactionRecord> all_records() const override;
 
     // Returns the stored records so tests can verify persistence behavior.
     [[nodiscard]] const std::vector<TransactionRecord>& records() const { return records_; }
@@ -153,6 +186,7 @@ public:
                     const std::string& client_order_id) override;
     void save_order_update(const trading::core::OrderUpdate& update) override;
     [[nodiscard]] std::optional<OrderRecord> get_order(const std::string& order_id) const override;
+    [[nodiscard]] std::vector<OrderRecord> all_open_orders() const override;
 
 private:
     std::unordered_map<std::string, OrderRecord> orders_;
@@ -173,9 +207,21 @@ class InMemoryPositionRepository final : public IPositionRepository {
 public:
     void save_position(const trading::core::Position& position) override;
     [[nodiscard]] std::optional<trading::core::Position> get_position(const std::string& instrument_id) const override;
+    [[nodiscard]] std::vector<trading::core::Position> all_positions() const override;
 
 private:
     std::unordered_map<std::string, trading::core::Position> positions_;
+};
+
+// Provides an in-memory balance repository implementation for tests and local scaffolding.
+class InMemoryBalanceRepository final : public IBalanceRepository {
+public:
+    void save_balance(const trading::core::BalanceSnapshot& balance) override;
+    [[nodiscard]] std::optional<trading::core::BalanceSnapshot> get_balance(const std::string& asset) const override;
+    [[nodiscard]] std::vector<trading::core::BalanceSnapshot> all_balances() const override;
+
+private:
+    std::unordered_map<std::string, trading::core::BalanceSnapshot> balances_;
 };
 
 // Provides an in-memory market snapshot cache implementation for tests and local scaffolding.

@@ -2,16 +2,21 @@
 
 #include "app/engine_controller.hpp"
 #include "app/mock_event_sources.hpp"
+#include "app/recovery_service.hpp"
 #include "app/simulation_runtime.hpp"
 #include "config/config_loader.hpp"
 #include "exchange/exchange_execution_adapter.hpp"
 #include "exchange/exchange_market_data_adapter.hpp"
+#include "infrastructure/kafka_transaction_consumer.hpp"
+#include "infrastructure/postgres_repositories.hpp"
+#include "infrastructure/redis_cache.hpp"
 #include "monitoring/health_status.hpp"
 #include "monitoring/logger.hpp"
 #include "storage/replay_service.hpp"
 
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -43,15 +48,53 @@ void Application::run() {
         throw std::runtime_error(*validation.error);
     }
 
-    // Step 3: Build the runtime controller with mock development data sources.
+    // Step 3: Build the runtime controller with durable infrastructure adapters.
     trading::core::SystemClock clock;
     trading::app::EngineController controller(clock);
     trading::monitoring::ConsoleStructuredLogger logger(std::cout);
     trading::monitoring::RuntimeHealthStatus health_status;
     const auto event_log_path = std::filesystem::temp_directory_path() / "wall-runtime-events.tsv";
+    const auto local_state_root = std::filesystem::temp_directory_path() / "wall-local-state";
     trading::storage::ReplayService replay_service(event_log_path);
     replay_service.reset_log();
     logger.log(trading::monitoring::LogLevel::info, "application_startup");
+    std::unique_ptr<trading::storage::ITransactionRepository> transaction_repository;
+    std::unique_ptr<trading::storage::IOrderRepository> order_repository;
+    std::unique_ptr<trading::storage::IPositionRepository> position_repository;
+    std::unique_ptr<trading::storage::IBalanceRepository> balance_repository;
+    std::unique_ptr<trading::storage::ITransactionCache> transaction_cache;
+    std::unique_ptr<trading::storage::IMarketStateCache> market_cache;
+    std::unique_ptr<trading::infrastructure::IKafkaConsumerClient> kafka_client;
+    std::string infrastructure_mode = "native";
+    std::string infrastructure_fallback_reason;
+
+    try {
+        transaction_repository = std::make_unique<trading::infrastructure::LibpqTransactionRepository>(config.postgres);
+        order_repository = std::make_unique<trading::infrastructure::LibpqOrderRepository>(config.postgres);
+        position_repository = std::make_unique<trading::infrastructure::LibpqPositionRepository>(config.postgres);
+        balance_repository = std::make_unique<trading::infrastructure::LibpqBalanceRepository>(config.postgres);
+        transaction_cache = std::make_unique<trading::infrastructure::HiredisTransactionCache>(config.redis);
+        market_cache = std::make_unique<trading::infrastructure::HiredisMarketStateCache>(config.redis);
+        kafka_client = std::make_unique<trading::infrastructure::RdKafkaConsumerClient>(config.kafka);
+    } catch (const std::exception& exception) {
+        infrastructure_mode = "fallback";
+        infrastructure_fallback_reason = exception.what();
+
+        transaction_repository = std::make_unique<trading::infrastructure::PostgresTransactionRepository>(local_state_root);
+        order_repository = std::make_unique<trading::infrastructure::PostgresOrderRepository>(local_state_root);
+        position_repository = std::make_unique<trading::infrastructure::PostgresPositionRepository>(local_state_root);
+        balance_repository = std::make_unique<trading::infrastructure::PostgresBalanceRepository>(local_state_root);
+        transaction_cache = std::make_unique<trading::infrastructure::RedisTransactionCache>();
+        market_cache = std::make_unique<trading::infrastructure::RedisMarketStateCache>();
+
+        logger.log(
+            trading::monitoring::LogLevel::warn,
+            "infrastructure_fallback_enabled",
+            {
+                {"reason", infrastructure_fallback_reason},
+                {"local_state_root", local_state_root.string()},
+            });
+    }
 
     const trading::core::Instrument instrument {
         .instrument_id = "mock:" + config.exchange_name + ":" + config.instruments.front(),
@@ -79,6 +122,14 @@ void Application::run() {
         throw std::runtime_error("failed to normalize startup market event: " + adapter_error->message);
     }
     const auto startup_market_event = std::get<trading::core::MarketEvent>(normalized_market_event);
+    const trading::storage::MarketSnapshot startup_market_snapshot {
+        .instrument_id = startup_market_event.instrument.instrument_id,
+        .best_bid = startup_market_event.bid_price,
+        .best_ask = startup_market_event.ask_price,
+        .last_trade_price = startup_market_event.price > 0.0 ? std::optional<double>(startup_market_event.price) : std::nullopt,
+        .last_trade_quantity = startup_market_event.quantity > 0.0 ? std::optional<double>(startup_market_event.quantity) : std::nullopt,
+        .last_process_timestamp = startup_market_event.process_timestamp,
+    };
 
     trading::app::MockMarketDataSource market_source({
         startup_market_event,
@@ -124,6 +175,21 @@ void Application::run() {
             },
             .auto_complete_partial_fills = config.simulation.auto_complete_partial_fills,
         });
+
+    trading::app::RecoveryService recovery_service(
+        *transaction_repository,
+        *order_repository,
+        *position_repository,
+        *balance_repository,
+        *market_cache,
+        *transaction_cache);
+    const auto recovery_snapshot = recovery_service.recover({
+        startup_market_snapshot,
+    });
+    recovery_service.restore_runtime(recovery_snapshot, runtime);
+    if (kafka_client != nullptr) {
+        recovery_service.resume_kafka(recovery_snapshot, *kafka_client);
+    }
 
     controller.subscribe([&runtime, &health_status](const trading::core::EngineEvent& event) {
         const auto approved_before = runtime.risk_approved_count();
@@ -183,6 +249,14 @@ void Application::run() {
 
     const auto processed_events = controller.run_once();
 
+    for (const auto& position : runtime.portfolio().all_positions()) {
+        position_repository->save_position(position);
+    }
+    for (const auto& balance : runtime.portfolio().all_balances()) {
+        balance_repository->save_balance(balance);
+    }
+    market_cache->upsert_snapshot(startup_market_snapshot);
+
     // Step 4: Print a startup summary for the current scaffold runtime.
     logger.log(
         trading::monitoring::LogLevel::info,
@@ -195,6 +269,12 @@ void Application::run() {
             {"risk_approved", std::to_string(runtime.risk_approved_count())},
             {"risk_rejected", std::to_string(runtime.risk_rejected_count())},
             {"fills_applied", std::to_string(runtime.applied_fill_count())},
+            {"recovered_open_orders", std::to_string(recovery_snapshot.open_orders.size())},
+            {"recovered_positions", std::to_string(recovery_snapshot.positions.size())},
+            {"recovered_balances", std::to_string(recovery_snapshot.balances.size())},
+            {"recovered_kafka_checkpoints", std::to_string(recovery_snapshot.kafka_checkpoints.size())},
+            {"infrastructure_mode", infrastructure_mode},
+            {"infrastructure_fallback_reason", infrastructure_fallback_reason.empty() ? "none" : infrastructure_fallback_reason},
             {"health_overall", trading::monitoring::to_string(health_status.overall_status())},
             {"event_log_path", event_log_path.string()},
             {"exchange_adapter_supports_cancel", execution_capabilities.supports_cancel ? "true" : "false"},

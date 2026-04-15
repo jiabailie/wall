@@ -29,6 +29,7 @@ add_library(trading_engine
     src/app/application.cpp
     src/app/engine_controller.cpp
     src/app/mock_event_sources.cpp
+    src/app/recovery_service.cpp
     src/app/simulation_runtime.cpp
     src/app/transaction_publisher_application.cpp
     src/config/config_loader.cpp

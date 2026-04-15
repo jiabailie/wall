@@ -232,4 +232,24 @@ void RdKafkaConsumerClient::commit(const std::string& topic, const int partition
     }
 }
 
+void RdKafkaConsumerClient::seek(const std::string& topic, const int partition, const std::int64_t next_offset) {
+    rd_kafka_topic_partition_list_t* offsets = rd_kafka_topic_partition_list_new(1);
+    rd_kafka_topic_partition_t* entry = rd_kafka_topic_partition_list_add(offsets, topic.c_str(), partition);
+    entry->offset = static_cast<int64_t>(next_offset);
+
+    const auto assign_error = rd_kafka_assign(handle_->consumer(), offsets);
+    if (assign_error != RD_KAFKA_RESP_ERR_NO_ERROR) {
+        rd_kafka_topic_partition_list_destroy(offsets);
+        throw std::runtime_error("Kafka assign failed during recovery: " + std::string(rd_kafka_err2str(assign_error)));
+    }
+
+    rd_kafka_error_t* seek_error = rd_kafka_seek_partitions(handle_->consumer(), offsets, 5000);
+    rd_kafka_topic_partition_list_destroy(offsets);
+    if (seek_error != nullptr) {
+        const std::string message = rd_kafka_error_string(seek_error);
+        rd_kafka_error_destroy(seek_error);
+        throw std::runtime_error("Kafka seek failed during recovery: " + message);
+    }
+}
+
 }  // namespace trading::infrastructure

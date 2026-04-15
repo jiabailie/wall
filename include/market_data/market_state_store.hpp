@@ -35,6 +35,9 @@ public:
     // Returns true when the instrument has not been updated within the threshold.
     bool is_stale(const std::string& instrument_id, std::int64_t stale_after_ms) const;
 
+    // Restores one persisted market snapshot into the in-memory state store.
+    void restore_snapshot(const std::string& instrument_id, const MarketState& snapshot);
+
 private:
     const trading::core::IClock& clock_;
     std::unordered_map<std::string, MarketState> states_;

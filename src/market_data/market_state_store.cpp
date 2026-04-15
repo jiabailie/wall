@@ -50,4 +50,8 @@ bool MarketStateStore::is_stale(const std::string& instrument_id, const std::int
     return (clock_.now_ms() - state->last_process_timestamp) > stale_after_ms;
 }
 
+void MarketStateStore::restore_snapshot(const std::string& instrument_id, const MarketState& snapshot) {
+    states_[instrument_id] = snapshot;
+}
+
 }  // namespace trading::market_data

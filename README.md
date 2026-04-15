@@ -23,7 +23,7 @@ The current codebase is beyond the initial scaffold stage, but it is not yet a f
 From the project root:
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d
+docker compose -f wall/docker-compose.yml up -d
 cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
@@ -34,7 +34,7 @@ ctest --test-dir build --output-on-failure
 To stop the local environment:
 
 ```bash
-docker compose -f docker/docker-compose.yml down
+docker compose -f wall/docker-compose.yml down
 ```
 
 ## Components
@@ -350,9 +350,22 @@ Expected behavior in the current scaffold:
 - logs processed market, transaction, and timer events
 - writes a replayable event log
 
-Example:
-
 The current engine executable is still a development-oriented bootstrap, not a long-running live trading process.
+
+Startup infrastructure behavior:
+
+- when PostgreSQL, Redis, and Kafka are reachable, `wall` uses the native adapters
+- when native infrastructure initialization fails, `wall` falls back to:
+  - file-backed local repositories
+  - in-memory cache adapters
+  - mock-driven startup processing without Kafka resume
+
+In fallback mode, startup logs include:
+
+- `message=infrastructure_fallback_enabled`
+- `infrastructure_mode=fallback`
+
+This lets local development continue even when Docker services are not running.
 
 ### Step 7: Shut Everything Down
 
@@ -377,6 +390,7 @@ Current status:
 - C++ transaction producer application is available
 - native Kafka consumer and producer adapters are implemented
 - live engine wiring to consume Kafka continuously is still incomplete
+- the main app falls back to local startup mode when Kafka is unavailable
 
 ### Redis
 
@@ -390,6 +404,7 @@ Current status:
 - Docker service is available
 - native Redis-backed cache adapters are implemented
 - the main runtime is not yet fully wired to use Redis in end-to-end live mode
+- the main app falls back to in-memory cache adapters when Redis is unavailable
 
 ### PostgreSQL
 
@@ -403,6 +418,7 @@ Current status:
 - Docker service is available
 - native PostgreSQL-backed repository adapters are implemented
 - the main runtime is not yet fully wired to use PostgreSQL in end-to-end live mode
+- the main app falls back to file-backed local repositories when PostgreSQL is unavailable
 
 ## How To Send Sample Transactions To Kafka
 
@@ -485,6 +501,8 @@ Implemented:
 - in-memory repository and cache scaffolding
 - native Redis cache adapters
 - native PostgreSQL repository adapters
+- startup reconciliation and recovery scaffolding
+- startup fallback from native infrastructure to local file-backed and in-memory adapters
 - local Docker stack
 - unit tests with mock data
 
@@ -492,7 +510,6 @@ Not implemented yet:
 
 - live exchange adapter
 - long-running live runtime wiring
-- startup reconciliation and restart recovery
 - production-grade operational controls
 - metrics and alerting
 
@@ -500,8 +517,8 @@ Not implemented yet:
 
 The next development slice should add:
 
-1. wire the native Kafka, Redis, and PostgreSQL adapters into a real runtime path
+1. replace mock sources with real live market-data and transaction ingestion loops
 2. replace mock event sources with real live ingestion and market-data flows
-3. add startup reconciliation and restart recovery
+3. add exchange-authoritative reconciliation and restart recovery
 4. add a first real exchange adapter
 5. add operational controls and metrics

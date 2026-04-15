@@ -4,6 +4,7 @@
 #include "core/types.hpp"
 #include "execution/simulated_execution_engine.hpp"
 #include "market_data/market_state_store.hpp"
+#include "storage/storage_interfaces.hpp"
 #include "portfolio/portfolio_service.hpp"
 #include "risk/risk_engine.hpp"
 #include "strategy/sample_threshold_strategy.hpp"
@@ -40,6 +41,18 @@ public:
 
     // Returns total applied fill count since startup.
     [[nodiscard]] std::size_t applied_fill_count() const { return applied_fill_count_; }
+
+    // Restores one persisted open order into the execution engine for startup recovery.
+    void restore_open_order(const trading::storage::OrderRecord& order);
+
+    // Restores one persisted position into the portfolio service for startup recovery.
+    void restore_position(const trading::core::Position& position);
+
+    // Restores one persisted balance into the portfolio service for startup recovery.
+    void restore_balance(const trading::core::BalanceSnapshot& balance);
+
+    // Restores one market snapshot into the market-state store and mark-price state.
+    void restore_market_snapshot(const trading::storage::MarketSnapshot& snapshot);
 
 private:
     void handle_execution_result(const trading::execution::ExecutionResult& result);

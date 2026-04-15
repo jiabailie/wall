@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace trading::portfolio {
 
@@ -22,6 +23,18 @@ public:
 
     // Updates the mark price used for unrealized PnL calculations.
     void set_mark_price(const std::string& instrument_id, double price);
+
+    // Restores one recovered position snapshot into the in-memory portfolio state.
+    void restore_position(const trading::core::Position& position);
+
+    // Restores one recovered balance snapshot into the in-memory portfolio state.
+    void restore_balance(const trading::core::BalanceSnapshot& balance);
+
+    // Returns all known positions for persistence and recovery workflows.
+    [[nodiscard]] std::vector<trading::core::Position> all_positions() const;
+
+    // Returns all known balances for persistence and recovery workflows.
+    [[nodiscard]] std::vector<trading::core::BalanceSnapshot> all_balances() const;
 
 private:
     [[nodiscard]] static double sign(double value);

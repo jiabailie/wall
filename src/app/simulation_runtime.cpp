@@ -59,4 +59,43 @@ void SimulationRuntime::handle_execution_result(const trading::execution::Execut
     }
 }
 
+void SimulationRuntime::restore_open_order(const trading::storage::OrderRecord& order) {
+    trading::core::OrderRequest request {
+        .request_id = order.order_id,
+        .strategy_id = order.strategy_id,
+        .instrument = {
+            .instrument_id = order.instrument_id,
+        },
+        .side = order.side,
+        .type = order.order_type,
+        .quantity = order.quantity,
+        .price = order.price,
+    };
+    execution_engine_.restore_open_order(order.order_id, order.client_order_id, request, order.filled_quantity);
+}
+
+void SimulationRuntime::restore_position(const trading::core::Position& position) {
+    portfolio_service_.restore_position(position);
+}
+
+void SimulationRuntime::restore_balance(const trading::core::BalanceSnapshot& balance) {
+    portfolio_service_.restore_balance(balance);
+}
+
+void SimulationRuntime::restore_market_snapshot(const trading::storage::MarketSnapshot& snapshot) {
+    market_state_store_.restore_snapshot(
+        snapshot.instrument_id,
+        {
+            .best_bid = snapshot.best_bid,
+            .best_ask = snapshot.best_ask,
+            .last_trade_price = snapshot.last_trade_price,
+            .last_trade_quantity = snapshot.last_trade_quantity,
+            .last_process_timestamp = snapshot.last_process_timestamp,
+        });
+
+    if (snapshot.last_trade_price.has_value()) {
+        portfolio_service_.set_mark_price(snapshot.instrument_id, *snapshot.last_trade_price);
+    }
+}
+
 }  // namespace trading::app

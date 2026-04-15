@@ -30,6 +30,9 @@ public:
 
     // Commits the provided topic/partition/offset as processed.
     virtual void commit(const std::string& topic, int partition, std::int64_t offset) = 0;
+
+    // Seeks the consumer to the provided next offset for startup recovery.
+    virtual void seek(const std::string& topic, int partition, std::int64_t next_offset) = 0;
 };
 
 // Adapts raw Kafka messages into TransactionCommand values used by the runtime.
@@ -60,6 +63,7 @@ public:
 
     std::optional<RawKafkaMessage> poll() override;
     void commit(const std::string& topic, int partition, std::int64_t offset) override;
+    void seek(const std::string& topic, int partition, std::int64_t next_offset) override;
 
 private:
     std::shared_ptr<RdKafkaConsumerHandle> handle_;
