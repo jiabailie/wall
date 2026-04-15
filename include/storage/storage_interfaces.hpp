@@ -25,6 +25,32 @@ struct KafkaCheckpoint {
     std::int64_t offset {0};
 };
 
+// Stores one persisted outbound order intent for audit and replay.
+struct OrderIntentRecord {
+    std::string request_id;
+    std::string strategy_id;
+    std::string instrument_id;
+    trading::core::OrderSide side {trading::core::OrderSide::buy};
+    trading::core::OrderType order_type {trading::core::OrderType::limit};
+    double quantity {0.0};
+    std::optional<double> price;
+};
+
+// Stores one persisted normalized exchange execution response for audit and replay.
+struct ExecutionReportRecord {
+    std::string report_id;
+    std::string order_id;
+    std::string client_order_id;
+    std::string instrument_id;
+    trading::core::OrderSide side {trading::core::OrderSide::buy};
+    trading::core::OrderStatus status {trading::core::OrderStatus::created};
+    double cumulative_filled_quantity {0.0};
+    std::optional<double> last_fill_price;
+    double last_fill_fee {0.0};
+    std::optional<std::string> reason;
+    std::int64_t exchange_timestamp {0};
+};
+
 // Stores one persisted order record.
 struct OrderRecord {
     std::string order_id;
@@ -62,6 +88,12 @@ public:
 
     // Returns all durable transaction-processing records.
     [[nodiscard]] virtual std::vector<TransactionRecord> all_records() const = 0;
+
+    // Persists one explicit Kafka resume checkpoint.
+    virtual void save_checkpoint(const KafkaCheckpoint& checkpoint) = 0;
+
+    // Returns all explicit Kafka resume checkpoints.
+    [[nodiscard]] virtual std::vector<KafkaCheckpoint> all_checkpoints() const = 0;
 };
 
 // Defines the cache boundary for hot transaction state.
@@ -103,6 +135,30 @@ public:
 
     // Returns all stored fills in insertion order.
     [[nodiscard]] virtual std::vector<trading::core::FillEvent> all_fills() const = 0;
+};
+
+// Defines the durable repository boundary for outbound order intents.
+class IOrderIntentRepository {
+public:
+    virtual ~IOrderIntentRepository() = default;
+
+    // Persists one outbound order intent before or at submit time.
+    virtual void append_intent(const OrderIntentRecord& intent) = 0;
+
+    // Returns all persisted order intents.
+    [[nodiscard]] virtual std::vector<OrderIntentRecord> all_intents() const = 0;
+};
+
+// Defines the durable repository boundary for normalized exchange responses.
+class IExecutionReportRepository {
+public:
+    virtual ~IExecutionReportRepository() = default;
+
+    // Persists one normalized exchange execution report.
+    virtual void append_report(const ExecutionReportRecord& report) = 0;
+
+    // Returns all persisted execution reports.
+    [[nodiscard]] virtual std::vector<ExecutionReportRecord> all_reports() const = 0;
 };
 
 // Defines the durable repository boundary for position records.
@@ -157,12 +213,15 @@ public:
     void save_processed(const std::string& transaction_id, const std::string& status) override;
 
     [[nodiscard]] std::vector<TransactionRecord> all_records() const override;
+    void save_checkpoint(const KafkaCheckpoint& checkpoint) override;
+    [[nodiscard]] std::vector<KafkaCheckpoint> all_checkpoints() const override;
 
     // Returns the stored records so tests can verify persistence behavior.
     [[nodiscard]] const std::vector<TransactionRecord>& records() const { return records_; }
 
 private:
     std::vector<TransactionRecord> records_;
+    std::vector<KafkaCheckpoint> checkpoints_;
 };
 
 // Provides an in-memory cache implementation for tests and local scaffolding.
@@ -200,6 +259,26 @@ public:
 
 private:
     std::vector<trading::core::FillEvent> fills_;
+};
+
+// Provides an in-memory order-intent repository implementation for tests and local scaffolding.
+class InMemoryOrderIntentRepository final : public IOrderIntentRepository {
+public:
+    void append_intent(const OrderIntentRecord& intent) override;
+    [[nodiscard]] std::vector<OrderIntentRecord> all_intents() const override;
+
+private:
+    std::vector<OrderIntentRecord> intents_;
+};
+
+// Provides an in-memory execution-report repository implementation for tests and local scaffolding.
+class InMemoryExecutionReportRepository final : public IExecutionReportRepository {
+public:
+    void append_report(const ExecutionReportRecord& report) override;
+    [[nodiscard]] std::vector<ExecutionReportRecord> all_reports() const override;
+
+private:
+    std::vector<ExecutionReportRecord> reports_;
 };
 
 // Provides an in-memory position repository implementation for tests and local scaffolding.

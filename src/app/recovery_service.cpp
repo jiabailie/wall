@@ -18,10 +18,11 @@ RecoverySnapshot RecoveryService::recover(const std::vector<trading::storage::Ma
     snapshot.positions = position_repository_.all_positions();
     snapshot.balances = balance_repository_.all_balances();
 
+    const auto explicit_checkpoints = transaction_repository_.all_checkpoints();
     std::unordered_map<std::string, trading::storage::KafkaCheckpoint> checkpoints_by_partition;
     for (const auto& record : transaction_repository_.all_records()) {
         transaction_cache_.set_status(record.transaction_id, record.status);
-        if (record.status != "processed") {
+        if (!explicit_checkpoints.empty() || record.status != "processed") {
             continue;
         }
 
@@ -36,9 +37,13 @@ RecoverySnapshot RecoveryService::recover(const std::vector<trading::storage::Ma
         }
     }
 
-    snapshot.kafka_checkpoints.reserve(checkpoints_by_partition.size());
-    for (const auto& [_, checkpoint] : checkpoints_by_partition) {
-        snapshot.kafka_checkpoints.push_back(checkpoint);
+    if (!explicit_checkpoints.empty()) {
+        snapshot.kafka_checkpoints = explicit_checkpoints;
+    } else {
+        snapshot.kafka_checkpoints.reserve(checkpoints_by_partition.size());
+        for (const auto& [_, checkpoint] : checkpoints_by_partition) {
+            snapshot.kafka_checkpoints.push_back(checkpoint);
+        }
     }
 
     if (!exchange_snapshots.empty()) {

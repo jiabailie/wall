@@ -104,6 +104,13 @@ public:
             "kafka_offset BIGINT NOT NULL"
             ")");
         exec_command(
+            "CREATE TABLE IF NOT EXISTS kafka_checkpoints ("
+            "topic TEXT NOT NULL,"
+            "partition_id INTEGER NOT NULL,"
+            "offset_value BIGINT NOT NULL,"
+            "PRIMARY KEY (topic, partition_id)"
+            ")");
+        exec_command(
             "CREATE TABLE IF NOT EXISTS order_records ("
             "order_id TEXT PRIMARY KEY,"
             "client_order_id TEXT NOT NULL,"
@@ -147,6 +154,32 @@ public:
             "average_entry_price DOUBLE PRECISION NOT NULL,"
             "realized_pnl DOUBLE PRECISION NOT NULL,"
             "unrealized_pnl DOUBLE PRECISION NOT NULL"
+            ")");
+        exec_command(
+            "CREATE TABLE IF NOT EXISTS order_intent_records ("
+            "sequence_id BIGSERIAL UNIQUE,"
+            "request_id TEXT PRIMARY KEY,"
+            "strategy_id TEXT NOT NULL,"
+            "instrument_id TEXT NOT NULL,"
+            "side INTEGER NOT NULL,"
+            "order_type INTEGER NOT NULL,"
+            "quantity DOUBLE PRECISION NOT NULL,"
+            "price DOUBLE PRECISION NULL"
+            ")");
+        exec_command(
+            "CREATE TABLE IF NOT EXISTS execution_report_records ("
+            "sequence_id BIGSERIAL UNIQUE,"
+            "report_id TEXT PRIMARY KEY,"
+            "order_id TEXT NOT NULL,"
+            "client_order_id TEXT NOT NULL,"
+            "instrument_id TEXT NOT NULL,"
+            "side INTEGER NOT NULL,"
+            "status INTEGER NOT NULL,"
+            "cumulative_filled_quantity DOUBLE PRECISION NOT NULL,"
+            "last_fill_price DOUBLE PRECISION NULL,"
+            "last_fill_fee DOUBLE PRECISION NOT NULL,"
+            "reason TEXT NULL,"
+            "exchange_timestamp BIGINT NOT NULL"
             ")");
     }
 
@@ -202,8 +235,10 @@ private:
 };
 
 PostgresTransactionRepository::PostgresTransactionRepository(std::filesystem::path root_directory)
-    : file_path_(std::move(root_directory) / "transactions.tsv") {
+    : file_path_(std::move(root_directory) / "transactions.tsv"),
+      checkpoint_file_path_(file_path_.parent_path() / "kafka_checkpoints.tsv") {
     load();
+    load_checkpoints();
 }
 
 // Persists the received transaction checkpoint.
@@ -244,6 +279,21 @@ std::vector<trading::storage::TransactionRecord> PostgresTransactionRepository::
     return records;
 }
 
+void PostgresTransactionRepository::save_checkpoint(const trading::storage::KafkaCheckpoint& checkpoint) {
+    checkpoints_[checkpoint.topic + "#" + std::to_string(checkpoint.partition)] = checkpoint;
+    flush_checkpoints();
+}
+
+std::vector<trading::storage::KafkaCheckpoint> PostgresTransactionRepository::all_checkpoints() const {
+    std::vector<trading::storage::KafkaCheckpoint> checkpoints;
+    checkpoints.reserve(checkpoints_.size());
+    for (const auto& [_, checkpoint] : checkpoints_) {
+        checkpoints.push_back(checkpoint);
+    }
+
+    return checkpoints;
+}
+
 // Returns one transaction record by id.
 std::optional<trading::storage::TransactionRecord> PostgresTransactionRepository::get_record(const std::string& transaction_id) const {
     if (const auto iterator = records_.find(transaction_id); iterator != records_.end()) {
@@ -278,6 +328,29 @@ void PostgresTransactionRepository::load() {
     }
 }
 
+void PostgresTransactionRepository::load_checkpoints() {
+    checkpoints_.clear();
+    if (!std::filesystem::exists(checkpoint_file_path_)) {
+        return;
+    }
+
+    std::ifstream input(checkpoint_file_path_);
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto fields = split_tsv(line);
+        if (fields.size() != 3) {
+            continue;
+        }
+
+        trading::storage::KafkaCheckpoint checkpoint {
+            .topic = fields[0],
+            .partition = std::stoi(fields[1]),
+            .offset = std::stoll(fields[2]),
+        };
+        checkpoints_[checkpoint.topic + "#" + std::to_string(checkpoint.partition)] = checkpoint;
+    }
+}
+
 // Flushes transaction records into deterministic TSV output.
 void PostgresTransactionRepository::flush() const {
     ensure_parent_directory(file_path_);
@@ -298,6 +371,26 @@ void PostgresTransactionRepository::flush() const {
             << record.kafka_topic << '\t'
             << record.kafka_partition << '\t'
             << record.kafka_offset << '\n';
+    }
+}
+
+void PostgresTransactionRepository::flush_checkpoints() const {
+    ensure_parent_directory(checkpoint_file_path_);
+
+    std::vector<std::string> keys;
+    keys.reserve(checkpoints_.size());
+    for (const auto& [key, _] : checkpoints_) {
+        keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    std::ofstream output(checkpoint_file_path_, std::ios::trunc);
+    for (const auto& key : keys) {
+        const auto& checkpoint = checkpoints_.at(key);
+        output
+            << checkpoint.topic << '\t'
+            << checkpoint.partition << '\t'
+            << checkpoint.offset << '\n';
     }
 }
 
@@ -503,6 +596,128 @@ void PostgresFillRepository::flush() const {
     }
 }
 
+PostgresOrderIntentRepository::PostgresOrderIntentRepository(std::filesystem::path root_directory)
+    : file_path_(std::move(root_directory) / "order_intents.tsv") {
+    load();
+}
+
+void PostgresOrderIntentRepository::append_intent(const trading::storage::OrderIntentRecord& intent) {
+    intents_.push_back(intent);
+    flush();
+}
+
+std::vector<trading::storage::OrderIntentRecord> PostgresOrderIntentRepository::all_intents() const {
+    return intents_;
+}
+
+void PostgresOrderIntentRepository::load() {
+    intents_.clear();
+    if (!std::filesystem::exists(file_path_)) {
+        return;
+    }
+
+    std::ifstream input(file_path_);
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto fields = split_tsv(line);
+        if (fields.size() != 7) {
+            continue;
+        }
+
+        intents_.push_back({
+            .request_id = fields[0],
+            .strategy_id = fields[1],
+            .instrument_id = fields[2],
+            .side = static_cast<trading::core::OrderSide>(std::stoi(fields[3])),
+            .order_type = static_cast<trading::core::OrderType>(std::stoi(fields[4])),
+            .quantity = std::stod(fields[5]),
+            .price = fields[6].empty() ? std::nullopt : std::optional<double>(std::stod(fields[6])),
+        });
+    }
+}
+
+void PostgresOrderIntentRepository::flush() const {
+    ensure_parent_directory(file_path_);
+
+    std::ofstream output(file_path_, std::ios::trunc);
+    output << std::setprecision(17);
+    for (const auto& intent : intents_) {
+        output
+            << intent.request_id << '\t'
+            << intent.strategy_id << '\t'
+            << intent.instrument_id << '\t'
+            << static_cast<int>(intent.side) << '\t'
+            << static_cast<int>(intent.order_type) << '\t'
+            << intent.quantity << '\t'
+            << encode_optional_double(intent.price) << '\n';
+    }
+}
+
+PostgresExecutionReportRepository::PostgresExecutionReportRepository(std::filesystem::path root_directory)
+    : file_path_(std::move(root_directory) / "execution_reports.tsv") {
+    load();
+}
+
+void PostgresExecutionReportRepository::append_report(const trading::storage::ExecutionReportRecord& report) {
+    reports_.push_back(report);
+    flush();
+}
+
+std::vector<trading::storage::ExecutionReportRecord> PostgresExecutionReportRepository::all_reports() const {
+    return reports_;
+}
+
+void PostgresExecutionReportRepository::load() {
+    reports_.clear();
+    if (!std::filesystem::exists(file_path_)) {
+        return;
+    }
+
+    std::ifstream input(file_path_);
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto fields = split_tsv(line);
+        if (fields.size() != 11) {
+            continue;
+        }
+
+        reports_.push_back({
+            .report_id = fields[0],
+            .order_id = fields[1],
+            .client_order_id = fields[2],
+            .instrument_id = fields[3],
+            .side = static_cast<trading::core::OrderSide>(std::stoi(fields[4])),
+            .status = static_cast<trading::core::OrderStatus>(std::stoi(fields[5])),
+            .cumulative_filled_quantity = std::stod(fields[6]),
+            .last_fill_price = fields[7].empty() ? std::nullopt : std::optional<double>(std::stod(fields[7])),
+            .last_fill_fee = std::stod(fields[8]),
+            .reason = fields[9].empty() ? std::nullopt : std::optional<std::string>(fields[9]),
+            .exchange_timestamp = std::stoll(fields[10]),
+        });
+    }
+}
+
+void PostgresExecutionReportRepository::flush() const {
+    ensure_parent_directory(file_path_);
+
+    std::ofstream output(file_path_, std::ios::trunc);
+    output << std::setprecision(17);
+    for (const auto& report : reports_) {
+        output
+            << report.report_id << '\t'
+            << report.order_id << '\t'
+            << report.client_order_id << '\t'
+            << report.instrument_id << '\t'
+            << static_cast<int>(report.side) << '\t'
+            << static_cast<int>(report.status) << '\t'
+            << report.cumulative_filled_quantity << '\t'
+            << encode_optional_double(report.last_fill_price) << '\t'
+            << report.last_fill_fee << '\t'
+            << (report.reason.has_value() ? *report.reason : "") << '\t'
+            << report.exchange_timestamp << '\n';
+    }
+}
+
 PostgresPositionRepository::PostgresPositionRepository(std::filesystem::path root_directory)
     : file_path_(std::move(root_directory) / "positions.tsv") {
     load();
@@ -703,6 +918,38 @@ void LibpqTransactionRepository::save_processed(const std::string& transaction_i
             status,
         });
     PQclear(result);
+}
+
+void LibpqTransactionRepository::save_checkpoint(const trading::storage::KafkaCheckpoint& checkpoint) {
+    auto* result = session_->exec_params(
+        "INSERT INTO kafka_checkpoints (topic, partition_id, offset_value) "
+        "VALUES ($1, $2, $3) "
+        "ON CONFLICT (topic, partition_id) DO UPDATE SET "
+        "offset_value = EXCLUDED.offset_value",
+        {
+            checkpoint.topic,
+            std::to_string(checkpoint.partition),
+            std::to_string(checkpoint.offset),
+        });
+    PQclear(result);
+}
+
+std::vector<trading::storage::KafkaCheckpoint> LibpqTransactionRepository::all_checkpoints() const {
+    auto* result = session_->exec(
+        "SELECT topic, partition_id, offset_value "
+        "FROM kafka_checkpoints");
+
+    std::vector<trading::storage::KafkaCheckpoint> checkpoints;
+    checkpoints.reserve(static_cast<std::size_t>(PQntuples(result)));
+    for (int row = 0; row < PQntuples(result); ++row) {
+        checkpoints.push_back({
+            .topic = PQgetvalue(result, row, 0),
+            .partition = std::stoi(PQgetvalue(result, row, 1)),
+            .offset = std::stoll(PQgetvalue(result, row, 2)),
+        });
+    }
+    PQclear(result);
+    return checkpoints;
 }
 
 std::vector<trading::storage::TransactionRecord> LibpqTransactionRepository::all_records() const {
@@ -917,6 +1164,123 @@ std::vector<trading::core::FillEvent> LibpqFillRepository::all_fills() const {
 
     PQclear(result);
     return fills;
+}
+
+LibpqOrderIntentRepository::LibpqOrderIntentRepository(const trading::config::PostgresConfig& config)
+    : session_(std::make_shared<LibpqSession>(config)) {}
+
+LibpqOrderIntentRepository::~LibpqOrderIntentRepository() = default;
+
+void LibpqOrderIntentRepository::append_intent(const trading::storage::OrderIntentRecord& intent) {
+    auto* result = session_->exec_params(
+        "INSERT INTO order_intent_records "
+        "(request_id, strategy_id, instrument_id, side, order_type, quantity, price) "
+        "VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::DOUBLE PRECISION) "
+        "ON CONFLICT (request_id) DO UPDATE SET "
+        "strategy_id = EXCLUDED.strategy_id, "
+        "instrument_id = EXCLUDED.instrument_id, "
+        "side = EXCLUDED.side, "
+        "order_type = EXCLUDED.order_type, "
+        "quantity = EXCLUDED.quantity, "
+        "price = EXCLUDED.price",
+        {
+            intent.request_id,
+            intent.strategy_id,
+            intent.instrument_id,
+            std::to_string(static_cast<int>(intent.side)),
+            std::to_string(static_cast<int>(intent.order_type)),
+            std::to_string(intent.quantity),
+            encode_optional_double(intent.price),
+        });
+    PQclear(result);
+}
+
+std::vector<trading::storage::OrderIntentRecord> LibpqOrderIntentRepository::all_intents() const {
+    auto* result = session_->exec(
+        "SELECT request_id, strategy_id, instrument_id, side, order_type, quantity, price "
+        "FROM order_intent_records ORDER BY sequence_id ASC");
+
+    std::vector<trading::storage::OrderIntentRecord> intents;
+    intents.reserve(static_cast<std::size_t>(PQntuples(result)));
+    for (int row = 0; row < PQntuples(result); ++row) {
+        intents.push_back({
+            .request_id = PQgetvalue(result, row, 0),
+            .strategy_id = PQgetvalue(result, row, 1),
+            .instrument_id = PQgetvalue(result, row, 2),
+            .side = static_cast<trading::core::OrderSide>(std::stoi(PQgetvalue(result, row, 3))),
+            .order_type = static_cast<trading::core::OrderType>(std::stoi(PQgetvalue(result, row, 4))),
+            .quantity = std::stod(PQgetvalue(result, row, 5)),
+            .price = decode_optional_double(PQgetvalue(result, row, 6)),
+        });
+    }
+    PQclear(result);
+    return intents;
+}
+
+LibpqExecutionReportRepository::LibpqExecutionReportRepository(const trading::config::PostgresConfig& config)
+    : session_(std::make_shared<LibpqSession>(config)) {}
+
+LibpqExecutionReportRepository::~LibpqExecutionReportRepository() = default;
+
+void LibpqExecutionReportRepository::append_report(const trading::storage::ExecutionReportRecord& report) {
+    auto* result = session_->exec_params(
+        "INSERT INTO execution_report_records "
+        "(report_id, order_id, client_order_id, instrument_id, side, status, cumulative_filled_quantity, "
+        "last_fill_price, last_fill_fee, reason, exchange_timestamp) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, '')::DOUBLE PRECISION, $9, $10, $11) "
+        "ON CONFLICT (report_id) DO UPDATE SET "
+        "order_id = EXCLUDED.order_id, "
+        "client_order_id = EXCLUDED.client_order_id, "
+        "instrument_id = EXCLUDED.instrument_id, "
+        "side = EXCLUDED.side, "
+        "status = EXCLUDED.status, "
+        "cumulative_filled_quantity = EXCLUDED.cumulative_filled_quantity, "
+        "last_fill_price = EXCLUDED.last_fill_price, "
+        "last_fill_fee = EXCLUDED.last_fill_fee, "
+        "reason = EXCLUDED.reason, "
+        "exchange_timestamp = EXCLUDED.exchange_timestamp",
+        {
+            report.report_id,
+            report.order_id,
+            report.client_order_id,
+            report.instrument_id,
+            std::to_string(static_cast<int>(report.side)),
+            std::to_string(static_cast<int>(report.status)),
+            std::to_string(report.cumulative_filled_quantity),
+            encode_optional_double(report.last_fill_price),
+            std::to_string(report.last_fill_fee),
+            report.reason.value_or(""),
+            std::to_string(report.exchange_timestamp),
+        });
+    PQclear(result);
+}
+
+std::vector<trading::storage::ExecutionReportRecord> LibpqExecutionReportRepository::all_reports() const {
+    auto* result = session_->exec(
+        "SELECT report_id, order_id, client_order_id, instrument_id, side, status, cumulative_filled_quantity, "
+        "last_fill_price, last_fill_fee, reason, exchange_timestamp "
+        "FROM execution_report_records ORDER BY sequence_id ASC");
+
+    std::vector<trading::storage::ExecutionReportRecord> reports;
+    reports.reserve(static_cast<std::size_t>(PQntuples(result)));
+    for (int row = 0; row < PQntuples(result); ++row) {
+        const char* reason = PQgetisnull(result, row, 9) ? nullptr : PQgetvalue(result, row, 9);
+        reports.push_back({
+            .report_id = PQgetvalue(result, row, 0),
+            .order_id = PQgetvalue(result, row, 1),
+            .client_order_id = PQgetvalue(result, row, 2),
+            .instrument_id = PQgetvalue(result, row, 3),
+            .side = static_cast<trading::core::OrderSide>(std::stoi(PQgetvalue(result, row, 4))),
+            .status = static_cast<trading::core::OrderStatus>(std::stoi(PQgetvalue(result, row, 5))),
+            .cumulative_filled_quantity = std::stod(PQgetvalue(result, row, 6)),
+            .last_fill_price = decode_optional_double(PQgetvalue(result, row, 7)),
+            .last_fill_fee = std::stod(PQgetvalue(result, row, 8)),
+            .reason = reason == nullptr ? std::nullopt : std::optional<std::string>(reason),
+            .exchange_timestamp = std::stoll(PQgetvalue(result, row, 10)),
+        });
+    }
+    PQclear(result);
+    return reports;
 }
 
 LibpqPositionRepository::LibpqPositionRepository(const trading::config::PostgresConfig& config)

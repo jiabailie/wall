@@ -22,6 +22,8 @@ public:
     void save_received(const trading::core::TransactionCommand& command) override;
     void save_processed(const std::string& transaction_id, const std::string& status) override;
     [[nodiscard]] std::vector<trading::storage::TransactionRecord> all_records() const override;
+    void save_checkpoint(const trading::storage::KafkaCheckpoint& checkpoint) override;
+    [[nodiscard]] std::vector<trading::storage::KafkaCheckpoint> all_checkpoints() const override;
 
     // Returns the current persisted record for test verification.
     [[nodiscard]] std::optional<trading::storage::TransactionRecord> get_record(const std::string& transaction_id) const;
@@ -29,9 +31,13 @@ public:
 private:
     void load();
     void flush() const;
+    void load_checkpoints();
+    void flush_checkpoints() const;
 
     std::filesystem::path file_path_;
+    std::filesystem::path checkpoint_file_path_;
     std::unordered_map<std::string, trading::storage::TransactionRecord> records_;
+    std::unordered_map<std::string, trading::storage::KafkaCheckpoint> checkpoints_;
 };
 
 // PostgreSQL-backed repository for transaction checkpoints using libpq.
@@ -43,6 +49,8 @@ public:
     void save_received(const trading::core::TransactionCommand& command) override;
     void save_processed(const std::string& transaction_id, const std::string& status) override;
     [[nodiscard]] std::vector<trading::storage::TransactionRecord> all_records() const override;
+    void save_checkpoint(const trading::storage::KafkaCheckpoint& checkpoint) override;
+    [[nodiscard]] std::vector<trading::storage::KafkaCheckpoint> all_checkpoints() const override;
     [[nodiscard]] std::optional<trading::storage::TransactionRecord> get_record(const std::string& transaction_id) const;
 
 private:
@@ -100,6 +108,64 @@ private:
 
     std::filesystem::path file_path_;
     std::vector<trading::core::FillEvent> fills_;
+};
+
+// File-backed adapter that simulates PostgreSQL persistence for order intents.
+class PostgresOrderIntentRepository final : public trading::storage::IOrderIntentRepository {
+public:
+    explicit PostgresOrderIntentRepository(std::filesystem::path root_directory);
+
+    void append_intent(const trading::storage::OrderIntentRecord& intent) override;
+    [[nodiscard]] std::vector<trading::storage::OrderIntentRecord> all_intents() const override;
+
+private:
+    void load();
+    void flush() const;
+
+    std::filesystem::path file_path_;
+    std::vector<trading::storage::OrderIntentRecord> intents_;
+};
+
+// PostgreSQL-backed repository for order intents using libpq.
+class LibpqOrderIntentRepository final : public trading::storage::IOrderIntentRepository {
+public:
+    explicit LibpqOrderIntentRepository(const trading::config::PostgresConfig& config);
+    ~LibpqOrderIntentRepository();
+
+    void append_intent(const trading::storage::OrderIntentRecord& intent) override;
+    [[nodiscard]] std::vector<trading::storage::OrderIntentRecord> all_intents() const override;
+
+private:
+    std::shared_ptr<LibpqSession> session_;
+};
+
+// File-backed adapter that simulates PostgreSQL persistence for execution reports.
+class PostgresExecutionReportRepository final : public trading::storage::IExecutionReportRepository {
+public:
+    explicit PostgresExecutionReportRepository(std::filesystem::path root_directory);
+
+    void append_report(const trading::storage::ExecutionReportRecord& report) override;
+    [[nodiscard]] std::vector<trading::storage::ExecutionReportRecord> all_reports() const override;
+
+private:
+    void load();
+    void flush() const;
+
+    std::filesystem::path file_path_;
+    std::vector<trading::storage::ExecutionReportRecord> reports_;
+};
+
+// PostgreSQL-backed repository for execution reports using libpq.
+class LibpqExecutionReportRepository final : public trading::storage::IExecutionReportRepository {
+public:
+    explicit LibpqExecutionReportRepository(const trading::config::PostgresConfig& config);
+    ~LibpqExecutionReportRepository();
+
+    void append_report(const trading::storage::ExecutionReportRecord& report) override;
+    [[nodiscard]] std::vector<trading::storage::ExecutionReportRecord> all_reports() const override;
+
+private:
+    std::shared_ptr<LibpqSession> session_;
 };
 
 // PostgreSQL-backed repository for fill records using libpq.

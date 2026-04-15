@@ -1573,6 +1573,27 @@ void test_postgres_transaction_checkpoint_persistence() {
     std::filesystem::remove_all(temp_dir);
 }
 
+// Verifies explicit Kafka checkpoints persist across repository restarts.
+void test_postgres_explicit_kafka_checkpoint_persistence() {
+    const auto temp_dir = make_temp_directory("postgres-explicit-checkpoint-repo");
+    {
+        trading::infrastructure::PostgresTransactionRepository repository(temp_dir);
+        repository.save_checkpoint({
+            .topic = "trading-transactions",
+            .partition = 2,
+            .offset = 144,
+        });
+    }
+    {
+        trading::infrastructure::PostgresTransactionRepository repository(temp_dir);
+        const auto checkpoints = repository.all_checkpoints();
+        expect_equal(checkpoints.size(), std::size_t {1}, "explicit checkpoint should persist");
+        expect_equal(checkpoints[0].partition, 2, "persisted checkpoint partition should reload");
+        expect_equal(checkpoints[0].offset, std::int64_t {144}, "persisted explicit checkpoint offset should reload");
+    }
+    std::filesystem::remove_all(temp_dir);
+}
+
 // Verifies balance snapshots persist across repository restarts.
 void test_postgres_balance_repository_write_read() {
     const auto temp_dir = make_temp_directory("postgres-balance-repo");
@@ -1590,6 +1611,63 @@ void test_postgres_balance_repository_write_read() {
         expect_true(balance.has_value(), "balance snapshot should persist");
         expect_equal(balance->total_balance, 10500.5, "persisted balance total should reload");
         expect_equal(balance->available_balance, 10400.25, "persisted balance available should reload");
+    }
+    std::filesystem::remove_all(temp_dir);
+}
+
+// Verifies order intents persist across repository restarts.
+void test_postgres_order_intent_repository_write_read() {
+    const auto temp_dir = make_temp_directory("postgres-order-intent-repo");
+    {
+        trading::infrastructure::PostgresOrderIntentRepository repository(temp_dir);
+        repository.append_intent({
+            .request_id = "req-1",
+            .strategy_id = "strategy-1",
+            .instrument_id = "binance:BTCUSDT",
+            .side = trading::core::OrderSide::buy,
+            .order_type = trading::core::OrderType::limit,
+            .quantity = 0.25,
+            .price = 42010.0,
+        });
+    }
+    {
+        trading::infrastructure::PostgresOrderIntentRepository repository(temp_dir);
+        const auto intents = repository.all_intents();
+        expect_equal(intents.size(), std::size_t {1}, "order intent should persist");
+        expect_equal(intents[0].request_id, std::string("req-1"), "persisted order intent id should reload");
+        expect_true(intents[0].price.has_value(), "persisted order intent price should reload");
+        expect_equal(*intents[0].price, 42010.0, "persisted order intent price should match");
+    }
+    std::filesystem::remove_all(temp_dir);
+}
+
+// Verifies execution reports persist across repository restarts.
+void test_postgres_execution_report_repository_write_read() {
+    const auto temp_dir = make_temp_directory("postgres-execution-report-repo");
+    {
+        trading::infrastructure::PostgresExecutionReportRepository repository(temp_dir);
+        repository.append_report({
+            .report_id = "report-1",
+            .order_id = "order-1",
+            .client_order_id = "client-1",
+            .instrument_id = "binance:BTCUSDT",
+            .side = trading::core::OrderSide::buy,
+            .status = trading::core::OrderStatus::partially_filled,
+            .cumulative_filled_quantity = 0.4,
+            .last_fill_price = 42020.0,
+            .last_fill_fee = 0.12,
+            .reason = std::string("partial_fill"),
+            .exchange_timestamp = 9001,
+        });
+    }
+    {
+        trading::infrastructure::PostgresExecutionReportRepository repository(temp_dir);
+        const auto reports = repository.all_reports();
+        expect_equal(reports.size(), std::size_t {1}, "execution report should persist");
+        expect_equal(reports[0].report_id, std::string("report-1"), "persisted execution report id should reload");
+        expect_equal(reports[0].cumulative_filled_quantity, 0.4, "persisted execution quantity should reload");
+        expect_true(reports[0].reason.has_value(), "persisted execution reason should reload");
+        expect_equal(*reports[0].reason, std::string("partial_fill"), "persisted execution reason should match");
     }
     std::filesystem::remove_all(temp_dir);
 }
@@ -1705,6 +1783,38 @@ void test_recovery_service_restores_runtime_and_cache() {
     const auto warmed_snapshot = market_cache.get_snapshot("binance:BTCUSDT");
     expect_true(warmed_snapshot.has_value(), "market cache should be warmed from exchange snapshot");
     expect_equal(*warmed_snapshot->best_bid, 41995.0, "warmed best bid should match exchange snapshot");
+}
+
+// Verifies explicit Kafka checkpoints override inferred transaction offsets during recovery.
+void test_recovery_service_prefers_explicit_checkpoints() {
+    trading::storage::InMemoryTransactionRepository transaction_repository;
+    trading::storage::InMemoryOrderRepository order_repository;
+    trading::storage::InMemoryPositionRepository position_repository;
+    trading::storage::InMemoryBalanceRepository balance_repository;
+    trading::storage::InMemoryMarketStateCache market_cache;
+    trading::storage::InMemoryTransactionCache transaction_cache;
+
+    auto tx = make_transaction("tx-1", 77);
+    tx.kafka_partition = 2;
+    transaction_repository.save_received(tx);
+    transaction_repository.save_processed("tx-1", "processed");
+    transaction_repository.save_checkpoint({
+        .topic = tx.kafka_topic,
+        .partition = tx.kafka_partition,
+        .offset = 55,
+    });
+
+    trading::app::RecoveryService recovery_service(
+        transaction_repository,
+        order_repository,
+        position_repository,
+        balance_repository,
+        market_cache,
+        transaction_cache);
+    const auto snapshot = recovery_service.recover();
+
+    expect_equal(snapshot.kafka_checkpoints.size(), std::size_t {1}, "one explicit checkpoint should be recovered");
+    expect_equal(snapshot.kafka_checkpoints[0].offset, std::int64_t {55}, "explicit checkpoint should override derived offset");
 }
 
 // Verifies Kafka recovery resumes from the next intended offset.
@@ -2248,8 +2358,12 @@ int main() {
         {"postgres_order_repository_write_read", test_postgres_order_repository_write_read},
         {"redis_cache_adapters_write_read", test_redis_cache_adapters_write_read},
         {"postgres_transaction_checkpoint_persistence", test_postgres_transaction_checkpoint_persistence},
+        {"postgres_explicit_kafka_checkpoint_persistence", test_postgres_explicit_kafka_checkpoint_persistence},
         {"postgres_balance_repository_write_read", test_postgres_balance_repository_write_read},
+        {"postgres_order_intent_repository_write_read", test_postgres_order_intent_repository_write_read},
+        {"postgres_execution_report_repository_write_read", test_postgres_execution_report_repository_write_read},
         {"recovery_service_restores_runtime_and_cache", test_recovery_service_restores_runtime_and_cache},
+        {"recovery_service_prefers_explicit_checkpoints", test_recovery_service_prefers_explicit_checkpoints},
         {"recovery_service_resumes_kafka_from_next_offset", test_recovery_service_resumes_kafka_from_next_offset},
         {"replay_service_reproduces_fixed_session_state", test_replay_service_reproduces_fixed_session_state},
         {"replay_service_skips_invalid_records", test_replay_service_skips_invalid_records},

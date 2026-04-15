@@ -38,6 +38,21 @@ std::vector<TransactionRecord> InMemoryTransactionRepository::all_records() cons
     return records_;
 }
 
+void InMemoryTransactionRepository::save_checkpoint(const KafkaCheckpoint& checkpoint) {
+    for (auto& existing : checkpoints_) {
+        if (existing.topic == checkpoint.topic && existing.partition == checkpoint.partition) {
+            existing.offset = checkpoint.offset;
+            return;
+        }
+    }
+
+    checkpoints_.push_back(checkpoint);
+}
+
+std::vector<KafkaCheckpoint> InMemoryTransactionRepository::all_checkpoints() const {
+    return checkpoints_;
+}
+
 // Stores the latest transaction status in insertion order.
 void InMemoryTransactionCache::set_status(const std::string& transaction_id, const std::string& status) {
     // Step 1: Update the existing entry when it already exists.
@@ -136,6 +151,22 @@ void InMemoryFillRepository::append_fill(const trading::core::FillEvent& fill) {
 // Returns all stored fills in insertion order.
 std::vector<trading::core::FillEvent> InMemoryFillRepository::all_fills() const {
     return fills_;
+}
+
+void InMemoryOrderIntentRepository::append_intent(const OrderIntentRecord& intent) {
+    intents_.push_back(intent);
+}
+
+std::vector<OrderIntentRecord> InMemoryOrderIntentRepository::all_intents() const {
+    return intents_;
+}
+
+void InMemoryExecutionReportRepository::append_report(const ExecutionReportRecord& report) {
+    reports_.push_back(report);
+}
+
+std::vector<ExecutionReportRecord> InMemoryExecutionReportRepository::all_reports() const {
+    return reports_;
 }
 
 // Stores the latest position keyed by instrument id.
