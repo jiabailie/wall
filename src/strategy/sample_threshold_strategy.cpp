@@ -59,9 +59,11 @@ trading::core::OrderRequest SampleThresholdStrategy::build_order_request(const d
     return {
         .request_id = request_id.str(),
         .strategy_id = config_.strategy_id,
-        .instrument = {
-            .instrument_id = config_.instrument_id,
-        },
+        .instrument = config_.instrument.instrument_id.empty()
+            ? trading::core::Instrument {
+                .instrument_id = config_.instrument_id,
+            }
+            : config_.instrument,
         .side = config_.side,
         .type = trading::core::OrderType::limit,
         .quantity = config_.order_quantity,

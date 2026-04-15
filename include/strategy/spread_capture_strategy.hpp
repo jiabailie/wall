@@ -6,20 +6,19 @@
 
 namespace trading::strategy {
 
-// Stores the configurable behavior for the sample threshold strategy.
-struct SampleThresholdStrategyConfig {
+// Stores the configurable behavior for a simple spread-capture strategy.
+struct SpreadCaptureStrategyConfig {
     std::string strategy_id;
-    std::string instrument_id;
     trading::core::Instrument instrument;
-    double trigger_price {0.0};
+    double min_spread {0.0};
     double order_quantity {0.0};
     trading::core::OrderSide side {trading::core::OrderSide::buy};
 };
 
-// Generates an order when a trade price crosses a configured threshold.
-class SampleThresholdStrategy final : public IStrategy {
+// Generates one order when the observed top-of-book spread exceeds a configured threshold.
+class SpreadCaptureStrategy final : public IStrategy {
 public:
-    explicit SampleThresholdStrategy(SampleThresholdStrategyConfig config) : config_(std::move(config)) {}
+    explicit SpreadCaptureStrategy(SpreadCaptureStrategyConfig config) : config_(std::move(config)) {}
 
     [[nodiscard]] std::string strategy_id() const override { return config_.strategy_id; }
 
@@ -28,10 +27,9 @@ public:
         const StrategyContext& context) override;
 
 private:
-    [[nodiscard]] bool should_emit_for_trade_price(double trade_price) const;
-    [[nodiscard]] trading::core::OrderRequest build_order_request(double trade_price);
+    [[nodiscard]] trading::core::OrderRequest build_order_request(double price);
 
-    SampleThresholdStrategyConfig config_;
+    SpreadCaptureStrategyConfig config_;
     bool has_emitted_signal_ {false};
     std::size_t next_request_id_ {1};
 };

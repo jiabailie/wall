@@ -14,9 +14,13 @@
 #include "monitoring/logger.hpp"
 #include "monitoring/metrics.hpp"
 #include "storage/replay_service.hpp"
+#include "strategy/sample_threshold_strategy.hpp"
+#include "strategy/spread_capture_strategy.hpp"
+#include "strategy/strategy_coordinator.hpp"
 
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -32,6 +36,44 @@ namespace {
 // Maps config side strings to domain enum values.
 trading::core::OrderSide parse_order_side(const std::string& side) {
     return side == "sell" ? trading::core::OrderSide::sell : trading::core::OrderSide::buy;
+}
+
+trading::core::Instrument build_instrument(const std::string& exchange, const std::string& symbol) {
+    return {
+        .instrument_id = exchange + ":" + symbol,
+        .exchange = exchange,
+        .symbol = symbol,
+        .base_asset = symbol.size() >= 3 ? symbol.substr(0, 3) : symbol,
+        .quote_asset = symbol.size() > 3 ? symbol.substr(3) : "USD",
+        .tick_size = 0.1,
+        .lot_size = 0.0001,
+    };
+}
+
+std::shared_ptr<trading::strategy::StrategyCoordinator> build_strategy_coordinator(const trading::config::AppConfig& config) {
+    auto coordinator = std::make_shared<trading::strategy::StrategyCoordinator>();
+    const auto primary_symbol = config.instruments.empty() ? "BTCUSDT" : config.instruments.front();
+    const auto primary_instrument = build_instrument(config.exchange_name, primary_symbol);
+
+    coordinator->add_strategy(std::make_unique<trading::strategy::SampleThresholdStrategy>(
+        trading::strategy::SampleThresholdStrategyConfig {
+            .strategy_id = config.strategy.strategy_id,
+            .instrument_id = primary_instrument.instrument_id,
+            .instrument = primary_instrument,
+            .trigger_price = config.strategy.trigger_price,
+            .order_quantity = config.strategy.order_quantity,
+            .side = parse_order_side(config.strategy.side),
+        }));
+    coordinator->add_strategy(std::make_unique<trading::strategy::SpreadCaptureStrategy>(
+        trading::strategy::SpreadCaptureStrategyConfig {
+            .strategy_id = config.strategy.strategy_id + "-spread",
+            .instrument = primary_instrument,
+            .min_spread = primary_instrument.tick_size * 5.0,
+            .order_quantity = config.strategy.order_quantity * 0.5,
+            .side = parse_order_side(config.strategy.side),
+        }));
+
+    return coordinator;
 }
 
 }  // namespace
@@ -168,10 +210,12 @@ void Application::run() {
             .strategy = {
                 .strategy_id = config.strategy.strategy_id,
                 .instrument_id = config.strategy.trigger_instrument_id,
+                .instrument = instrument,
                 .trigger_price = config.strategy.trigger_price,
                 .order_quantity = config.strategy.order_quantity,
                 .side = parse_order_side(config.strategy.side),
             },
+            .strategy_coordinator = build_strategy_coordinator(config),
             .execution = {
                 .partial_fill_threshold = config.simulation.partial_fill_threshold,
                 .partial_fill_ratio = config.simulation.partial_fill_ratio,
