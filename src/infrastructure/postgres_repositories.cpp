@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -233,6 +234,16 @@ void PostgresTransactionRepository::save_processed(const std::string& transactio
     flush();
 }
 
+std::vector<trading::storage::TransactionRecord> PostgresTransactionRepository::all_records() const {
+    std::vector<trading::storage::TransactionRecord> records;
+    records.reserve(records_.size());
+    for (const auto& [_, record] : records_) {
+        records.push_back(record);
+    }
+
+    return records;
+}
+
 // Returns one transaction record by id.
 std::optional<trading::storage::TransactionRecord> PostgresTransactionRepository::get_record(const std::string& transaction_id) const {
     if (const auto iterator = records_.find(transaction_id); iterator != records_.end()) {
@@ -338,6 +349,25 @@ std::optional<trading::storage::OrderRecord> PostgresOrderRepository::get_order(
     }
 
     return std::nullopt;
+}
+
+std::vector<trading::storage::OrderRecord> PostgresOrderRepository::all_open_orders() const {
+    std::vector<trading::storage::OrderRecord> open_orders;
+    for (const auto& [_, order] : orders_) {
+        switch (order.status) {
+            case trading::core::OrderStatus::created:
+            case trading::core::OrderStatus::pending_submit:
+            case trading::core::OrderStatus::acknowledged:
+            case trading::core::OrderStatus::partially_filled:
+            case trading::core::OrderStatus::pending_cancel:
+                open_orders.push_back(order);
+                break;
+            default:
+                break;
+        }
+    }
+
+    return open_orders;
 }
 
 // Loads order records from file.
@@ -493,6 +523,16 @@ std::optional<trading::core::Position> PostgresPositionRepository::get_position(
     return std::nullopt;
 }
 
+std::vector<trading::core::Position> PostgresPositionRepository::all_positions() const {
+    std::vector<trading::core::Position> positions;
+    positions.reserve(positions_.size());
+    for (const auto& [_, position] : positions_) {
+        positions.push_back(position);
+    }
+
+    return positions;
+}
+
 // Loads position records from file.
 void PostgresPositionRepository::load() {
     positions_.clear();
@@ -558,6 +598,77 @@ void PostgresPositionRepository::flush() const {
     }
 }
 
+PostgresBalanceRepository::PostgresBalanceRepository(std::filesystem::path root_directory)
+    : file_path_(std::move(root_directory) / "balances.tsv") {
+    load();
+}
+
+void PostgresBalanceRepository::save_balance(const trading::core::BalanceSnapshot& balance) {
+    balances_[balance.asset] = balance;
+    flush();
+}
+
+std::optional<trading::core::BalanceSnapshot> PostgresBalanceRepository::get_balance(const std::string& asset) const {
+    if (const auto iterator = balances_.find(asset); iterator != balances_.end()) {
+        return iterator->second;
+    }
+
+    return std::nullopt;
+}
+
+std::vector<trading::core::BalanceSnapshot> PostgresBalanceRepository::all_balances() const {
+    std::vector<trading::core::BalanceSnapshot> balances;
+    balances.reserve(balances_.size());
+    for (const auto& [_, balance] : balances_) {
+        balances.push_back(balance);
+    }
+
+    return balances;
+}
+
+void PostgresBalanceRepository::load() {
+    balances_.clear();
+    if (!std::filesystem::exists(file_path_)) {
+        return;
+    }
+
+    std::ifstream input(file_path_);
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto fields = split_tsv(line);
+        if (fields.size() != 3) {
+            continue;
+        }
+
+        balances_[fields[0]] = {
+            .asset = fields[0],
+            .total_balance = std::stod(fields[1]),
+            .available_balance = std::stod(fields[2]),
+        };
+    }
+}
+
+void PostgresBalanceRepository::flush() const {
+    ensure_parent_directory(file_path_);
+
+    std::vector<std::string> keys;
+    keys.reserve(balances_.size());
+    for (const auto& [asset, _] : balances_) {
+        keys.push_back(asset);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    std::ofstream output(file_path_, std::ios::trunc);
+    output << std::setprecision(17);
+    for (const auto& key : keys) {
+        const auto& balance = balances_.at(key);
+        output
+            << balance.asset << '\t'
+            << balance.total_balance << '\t'
+            << balance.available_balance << '\n';
+    }
+}
+
 LibpqTransactionRepository::LibpqTransactionRepository(const trading::config::PostgresConfig& config)
     : session_(std::make_shared<LibpqSession>(config)) {}
 
@@ -592,6 +703,26 @@ void LibpqTransactionRepository::save_processed(const std::string& transaction_i
             status,
         });
     PQclear(result);
+}
+
+std::vector<trading::storage::TransactionRecord> LibpqTransactionRepository::all_records() const {
+    auto* result = session_->exec(
+        "SELECT transaction_id, status, kafka_topic, kafka_partition, kafka_offset "
+        "FROM transaction_records");
+
+    std::vector<trading::storage::TransactionRecord> records;
+    records.reserve(static_cast<std::size_t>(PQntuples(result)));
+    for (int row = 0; row < PQntuples(result); ++row) {
+        records.push_back({
+            .transaction_id = PQgetvalue(result, row, 0),
+            .status = PQgetvalue(result, row, 1),
+            .kafka_topic = PQgetvalue(result, row, 2),
+            .kafka_partition = std::stoi(PQgetvalue(result, row, 3)),
+            .kafka_offset = std::stoll(PQgetvalue(result, row, 4)),
+        });
+    }
+    PQclear(result);
+    return records;
 }
 
 std::optional<trading::storage::TransactionRecord> LibpqTransactionRepository::get_record(
@@ -701,6 +832,31 @@ std::optional<trading::storage::OrderRecord> LibpqOrderRepository::get_order(con
     };
     PQclear(result);
     return record;
+}
+
+std::vector<trading::storage::OrderRecord> LibpqOrderRepository::all_open_orders() const {
+    auto* result = session_->exec(
+        "SELECT order_id, client_order_id, strategy_id, instrument_id, side, order_type, status, quantity, price, filled_quantity "
+        "FROM order_records WHERE status IN (0, 1, 2, 3, 5)");
+
+    std::vector<trading::storage::OrderRecord> orders;
+    orders.reserve(static_cast<std::size_t>(PQntuples(result)));
+    for (int row = 0; row < PQntuples(result); ++row) {
+        orders.push_back({
+            .order_id = PQgetvalue(result, row, 0),
+            .client_order_id = PQgetvalue(result, row, 1),
+            .strategy_id = PQgetvalue(result, row, 2),
+            .instrument_id = PQgetvalue(result, row, 3),
+            .side = static_cast<trading::core::OrderSide>(std::stoi(PQgetvalue(result, row, 4))),
+            .order_type = static_cast<trading::core::OrderType>(std::stoi(PQgetvalue(result, row, 5))),
+            .status = static_cast<trading::core::OrderStatus>(std::stoi(PQgetvalue(result, row, 6))),
+            .quantity = std::stod(PQgetvalue(result, row, 7)),
+            .price = decode_optional_double(PQgetvalue(result, row, 8)),
+            .filled_quantity = std::stod(PQgetvalue(result, row, 9)),
+        });
+    }
+    PQclear(result);
+    return orders;
 }
 
 LibpqFillRepository::LibpqFillRepository(const trading::config::PostgresConfig& config)
@@ -833,6 +989,100 @@ std::optional<trading::core::Position> LibpqPositionRepository::get_position(con
     };
     PQclear(result);
     return position;
+}
+
+std::vector<trading::core::Position> LibpqPositionRepository::all_positions() const {
+    auto* result = session_->exec(
+        "SELECT position_id, instrument_id, exchange, symbol, base_asset, quote_asset, tick_size, lot_size, net_quantity, average_entry_price, realized_pnl, unrealized_pnl "
+        "FROM position_records");
+
+    std::vector<trading::core::Position> positions;
+    positions.reserve(static_cast<std::size_t>(PQntuples(result)));
+    for (int row = 0; row < PQntuples(result); ++row) {
+        positions.push_back({
+            .position_id = PQgetvalue(result, row, 0),
+            .instrument = {
+                .instrument_id = PQgetvalue(result, row, 1),
+                .exchange = PQgetvalue(result, row, 2),
+                .symbol = PQgetvalue(result, row, 3),
+                .base_asset = PQgetvalue(result, row, 4),
+                .quote_asset = PQgetvalue(result, row, 5),
+                .tick_size = std::stod(PQgetvalue(result, row, 6)),
+                .lot_size = std::stod(PQgetvalue(result, row, 7)),
+            },
+            .net_quantity = std::stod(PQgetvalue(result, row, 8)),
+            .average_entry_price = std::stod(PQgetvalue(result, row, 9)),
+            .realized_pnl = std::stod(PQgetvalue(result, row, 10)),
+            .unrealized_pnl = std::stod(PQgetvalue(result, row, 11)),
+        });
+    }
+    PQclear(result);
+    return positions;
+}
+
+LibpqBalanceRepository::LibpqBalanceRepository(const trading::config::PostgresConfig& config)
+    : session_(std::make_shared<LibpqSession>(config)) {
+    auto* result = session_->exec(
+        "CREATE TABLE IF NOT EXISTS balance_records ("
+        "asset TEXT PRIMARY KEY,"
+        "total_balance DOUBLE PRECISION NOT NULL,"
+        "available_balance DOUBLE PRECISION NOT NULL"
+        ")");
+    PQclear(result);
+}
+
+LibpqBalanceRepository::~LibpqBalanceRepository() = default;
+
+void LibpqBalanceRepository::save_balance(const trading::core::BalanceSnapshot& balance) {
+    auto* result = session_->exec_params(
+        "INSERT INTO balance_records (asset, total_balance, available_balance) "
+        "VALUES ($1, $2, $3) "
+        "ON CONFLICT (asset) DO UPDATE SET "
+        "total_balance = EXCLUDED.total_balance, "
+        "available_balance = EXCLUDED.available_balance",
+        {
+            balance.asset,
+            std::to_string(balance.total_balance),
+            std::to_string(balance.available_balance),
+        });
+    PQclear(result);
+}
+
+std::optional<trading::core::BalanceSnapshot> LibpqBalanceRepository::get_balance(const std::string& asset) const {
+    auto* result = session_->exec_params(
+        "SELECT asset, total_balance, available_balance FROM balance_records WHERE asset = $1",
+        {
+            asset,
+        });
+    if (PQntuples(result) == 0) {
+        PQclear(result);
+        return std::nullopt;
+    }
+
+    trading::core::BalanceSnapshot balance {
+        .asset = PQgetvalue(result, 0, 0),
+        .total_balance = std::stod(PQgetvalue(result, 0, 1)),
+        .available_balance = std::stod(PQgetvalue(result, 0, 2)),
+    };
+    PQclear(result);
+    return balance;
+}
+
+std::vector<trading::core::BalanceSnapshot> LibpqBalanceRepository::all_balances() const {
+    auto* result = session_->exec(
+        "SELECT asset, total_balance, available_balance FROM balance_records");
+
+    std::vector<trading::core::BalanceSnapshot> balances;
+    balances.reserve(static_cast<std::size_t>(PQntuples(result)));
+    for (int row = 0; row < PQntuples(result); ++row) {
+        balances.push_back({
+            .asset = PQgetvalue(result, row, 0),
+            .total_balance = std::stod(PQgetvalue(result, row, 1)),
+            .available_balance = std::stod(PQgetvalue(result, row, 2)),
+        });
+    }
+    PQclear(result);
+    return balances;
 }
 
 }  // namespace trading::infrastructure

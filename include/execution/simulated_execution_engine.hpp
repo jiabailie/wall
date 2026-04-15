@@ -37,6 +37,12 @@ public:
     // Cancels an open partially-filled order and returns the cancel lifecycle events.
     [[nodiscard]] ExecutionResult cancel_open_order(const std::string& order_id);
 
+    // Restores one partially-complete open order during startup recovery.
+    void restore_open_order(const std::string& order_id,
+                            const std::string& client_order_id,
+                            const trading::core::OrderRequest& request,
+                            double filled_quantity);
+
 private:
     struct OpenOrderState {
         trading::core::OrderRequest request;

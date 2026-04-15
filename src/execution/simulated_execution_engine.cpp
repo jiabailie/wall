@@ -154,6 +154,17 @@ ExecutionResult SimulatedExecutionEngine::cancel_open_order(const std::string& o
     return result;
 }
 
+void SimulatedExecutionEngine::restore_open_order(const std::string& order_id,
+                                                  const std::string& client_order_id,
+                                                  const trading::core::OrderRequest& request,
+                                                  const double filled_quantity) {
+    open_orders_[order_id] = OpenOrderState {
+        .request = request,
+        .client_order_id = client_order_id,
+        .filled_quantity = filled_quantity,
+    };
+}
+
 // Returns the configured partial fill ratio clamped into a safe range.
 double SimulatedExecutionEngine::clamp_partial_fill_ratio() const {
     return std::clamp(config_.partial_fill_ratio, 0.0, 1.0);
