@@ -1,6 +1,7 @@
 #pragma once
 
 #include "exchange/exchange_market_data_adapter.hpp"
+#include "execution/live_execution_tracker.hpp"
 #include "execution/simulated_execution_engine.hpp"
 
 #include <string>
@@ -46,6 +47,27 @@ public:
 
 private:
     trading::execution::SimulatedExecutionEngine engine_;
+};
+
+// Wraps the live execution tracker behind the execution adapter boundary for development and tests.
+class MockLiveExchangeExecutionAdapter final : public IExchangeExecutionAdapter {
+public:
+    [[nodiscard]] ExchangeExecutionCapabilities capabilities() const override;
+    [[nodiscard]] trading::execution::ExecutionResult submit(const trading::core::OrderRequest& request) override;
+    [[nodiscard]] trading::execution::ExecutionResult cancel(const std::string& order_id,
+                                                             const std::string& client_order_id) override;
+
+    // Applies one normalized exchange execution report to local state.
+    [[nodiscard]] trading::execution::ReconciliationResult apply_exchange_report(
+        const trading::execution::ExecutionReport& report);
+
+    // Returns the current local order view for reconciliation tests.
+    [[nodiscard]] std::optional<trading::storage::OrderRecord> get_order(const std::string& order_id) const;
+
+private:
+    trading::execution::LiveExecutionTracker tracker_;
+    std::size_t next_order_id_ {1};
+    std::size_t next_client_order_id_ {1};
 };
 
 }  // namespace trading::exchange
