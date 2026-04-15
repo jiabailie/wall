@@ -1,10 +1,15 @@
 #include "infrastructure/postgres_repositories.hpp"
 
+#include <libpq-fe.h>
+
 #include <algorithm>
 #include <fstream>
+#include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace trading::infrastructure {
@@ -30,7 +35,170 @@ void ensure_parent_directory(const std::filesystem::path& file_path) {
     }
 }
 
+std::string encode_optional_double(const std::optional<double>& value) {
+    return value.has_value() ? std::to_string(*value) : "";
+}
+
+std::optional<double> decode_optional_double(const char* value) {
+    if (value == nullptr || *value == '\0') {
+        return std::nullopt;
+    }
+
+    return std::stod(value);
+}
+
+void ensure_result_ok(PGresult* result, const std::string_view context) {
+    if (result == nullptr) {
+        throw std::runtime_error("PostgreSQL operation failed during " + std::string(context));
+    }
+
+    const auto status = PQresultStatus(result);
+    if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
+        const std::string message = PQresultErrorMessage(result);
+        PQclear(result);
+        throw std::runtime_error("PostgreSQL operation failed during " + std::string(context) + ": " + message);
+    }
+}
+
 }  // namespace
+
+class LibpqSession {
+public:
+    explicit LibpqSession(const trading::config::PostgresConfig& config) {
+        const std::string port = std::to_string(config.port);
+
+        const char* keywords[] = {
+            "host",
+            "port",
+            "dbname",
+            "user",
+            "password",
+            nullptr,
+        };
+        const char* values[] = {
+            config.host.c_str(),
+            port.c_str(),
+            config.database.c_str(),
+            config.user.c_str(),
+            config.password.c_str(),
+            nullptr,
+        };
+
+        connection_ = PQconnectdbParams(keywords, values, 0);
+        if (connection_ == nullptr || PQstatus(connection_) != CONNECTION_OK) {
+            const std::string message = connection_ == nullptr ? "null connection" : PQerrorMessage(connection_);
+            if (connection_ != nullptr) {
+                PQfinish(connection_);
+                connection_ = nullptr;
+            }
+            throw std::runtime_error("failed to connect to PostgreSQL: " + message);
+        }
+
+        exec_command(
+            "CREATE TABLE IF NOT EXISTS transaction_records ("
+            "transaction_id TEXT PRIMARY KEY,"
+            "status TEXT NOT NULL,"
+            "kafka_topic TEXT NOT NULL,"
+            "kafka_partition INTEGER NOT NULL,"
+            "kafka_offset BIGINT NOT NULL"
+            ")");
+        exec_command(
+            "CREATE TABLE IF NOT EXISTS order_records ("
+            "order_id TEXT PRIMARY KEY,"
+            "client_order_id TEXT NOT NULL,"
+            "strategy_id TEXT NOT NULL,"
+            "instrument_id TEXT NOT NULL,"
+            "side INTEGER NOT NULL,"
+            "order_type INTEGER NOT NULL,"
+            "status INTEGER NOT NULL,"
+            "quantity DOUBLE PRECISION NOT NULL,"
+            "price DOUBLE PRECISION NULL,"
+            "filled_quantity DOUBLE PRECISION NOT NULL"
+            ")");
+        exec_command(
+            "CREATE TABLE IF NOT EXISTS fill_records ("
+            "sequence_id BIGSERIAL UNIQUE,"
+            "fill_id TEXT PRIMARY KEY,"
+            "order_id TEXT NOT NULL,"
+            "instrument_id TEXT NOT NULL,"
+            "exchange TEXT NOT NULL,"
+            "symbol TEXT NOT NULL,"
+            "base_asset TEXT NOT NULL,"
+            "quote_asset TEXT NOT NULL,"
+            "tick_size DOUBLE PRECISION NOT NULL,"
+            "lot_size DOUBLE PRECISION NOT NULL,"
+            "side INTEGER NOT NULL,"
+            "price DOUBLE PRECISION NOT NULL,"
+            "quantity DOUBLE PRECISION NOT NULL,"
+            "fee DOUBLE PRECISION NOT NULL"
+            ")");
+        exec_command(
+            "CREATE TABLE IF NOT EXISTS position_records ("
+            "instrument_id TEXT PRIMARY KEY,"
+            "position_id TEXT NOT NULL,"
+            "exchange TEXT NOT NULL,"
+            "symbol TEXT NOT NULL,"
+            "base_asset TEXT NOT NULL,"
+            "quote_asset TEXT NOT NULL,"
+            "tick_size DOUBLE PRECISION NOT NULL,"
+            "lot_size DOUBLE PRECISION NOT NULL,"
+            "net_quantity DOUBLE PRECISION NOT NULL,"
+            "average_entry_price DOUBLE PRECISION NOT NULL,"
+            "realized_pnl DOUBLE PRECISION NOT NULL,"
+            "unrealized_pnl DOUBLE PRECISION NOT NULL"
+            ")");
+    }
+
+    ~LibpqSession() {
+        if (connection_ != nullptr) {
+            PQfinish(connection_);
+        }
+    }
+
+    LibpqSession(const LibpqSession&) = delete;
+    LibpqSession& operator=(const LibpqSession&) = delete;
+
+    [[nodiscard]] PGresult* exec(const std::string& sql) const {
+        auto* result = PQexec(connection_, sql.c_str());
+        ensure_result_ok(result, sql);
+        return result;
+    }
+
+    void exec_command(const std::string& sql) const {
+        auto* result = exec(sql);
+        PQclear(result);
+    }
+
+    [[nodiscard]] PGresult* exec_params(const std::string& sql,
+                                        const std::vector<std::string>& values,
+                                        const std::vector<int>& formats = {}) const {
+        std::vector<const char*> raw_values;
+        raw_values.reserve(values.size());
+        for (const auto& value : values) {
+            raw_values.push_back(value.c_str());
+        }
+
+        std::vector<int> actual_formats = formats;
+        if (actual_formats.empty()) {
+            actual_formats.resize(values.size(), 0);
+        }
+
+        auto* result = PQexecParams(
+            connection_,
+            sql.c_str(),
+            static_cast<int>(values.size()),
+            nullptr,
+            raw_values.data(),
+            nullptr,
+            actual_formats.data(),
+            0);
+        ensure_result_ok(result, sql);
+        return result;
+    }
+
+private:
+    PGconn* connection_ {nullptr};
+};
 
 PostgresTransactionRepository::PostgresTransactionRepository(std::filesystem::path root_directory)
     : file_path_(std::move(root_directory) / "transactions.tsv") {
@@ -388,6 +556,283 @@ void PostgresPositionRepository::flush() const {
             << position.realized_pnl << '\t'
             << position.unrealized_pnl << '\n';
     }
+}
+
+LibpqTransactionRepository::LibpqTransactionRepository(const trading::config::PostgresConfig& config)
+    : session_(std::make_shared<LibpqSession>(config)) {}
+
+LibpqTransactionRepository::~LibpqTransactionRepository() = default;
+
+void LibpqTransactionRepository::save_received(const trading::core::TransactionCommand& command) {
+    auto* result = session_->exec_params(
+        "INSERT INTO transaction_records (transaction_id, status, kafka_topic, kafka_partition, kafka_offset) "
+        "VALUES ($1, $2, $3, $4, $5) "
+        "ON CONFLICT (transaction_id) DO UPDATE SET "
+        "status = EXCLUDED.status, "
+        "kafka_topic = EXCLUDED.kafka_topic, "
+        "kafka_partition = EXCLUDED.kafka_partition, "
+        "kafka_offset = EXCLUDED.kafka_offset",
+        {
+            command.transaction_id,
+            "received",
+            command.kafka_topic,
+            std::to_string(command.kafka_partition),
+            std::to_string(command.kafka_offset),
+        });
+    PQclear(result);
+}
+
+void LibpqTransactionRepository::save_processed(const std::string& transaction_id, const std::string& status) {
+    auto* result = session_->exec_params(
+        "INSERT INTO transaction_records (transaction_id, status, kafka_topic, kafka_partition, kafka_offset) "
+        "VALUES ($1, $2, '', 0, 0) "
+        "ON CONFLICT (transaction_id) DO UPDATE SET status = EXCLUDED.status",
+        {
+            transaction_id,
+            status,
+        });
+    PQclear(result);
+}
+
+std::optional<trading::storage::TransactionRecord> LibpqTransactionRepository::get_record(
+    const std::string& transaction_id) const {
+    auto* result = session_->exec_params(
+        "SELECT transaction_id, status, kafka_topic, kafka_partition, kafka_offset "
+        "FROM transaction_records WHERE transaction_id = $1",
+        {
+            transaction_id,
+        });
+
+    if (PQntuples(result) == 0) {
+        PQclear(result);
+        return std::nullopt;
+    }
+
+    trading::storage::TransactionRecord record {
+        .transaction_id = PQgetvalue(result, 0, 0),
+        .status = PQgetvalue(result, 0, 1),
+        .kafka_topic = PQgetvalue(result, 0, 2),
+        .kafka_partition = std::stoi(PQgetvalue(result, 0, 3)),
+        .kafka_offset = std::stoll(PQgetvalue(result, 0, 4)),
+    };
+    PQclear(result);
+    return record;
+}
+
+LibpqOrderRepository::LibpqOrderRepository(const trading::config::PostgresConfig& config)
+    : session_(std::make_shared<LibpqSession>(config)) {}
+
+LibpqOrderRepository::~LibpqOrderRepository() = default;
+
+void LibpqOrderRepository::save_order(const trading::core::OrderRequest& request,
+                                      const std::string& order_id,
+                                      const std::string& client_order_id) {
+    auto* result = session_->exec_params(
+        "INSERT INTO order_records "
+        "(order_id, client_order_id, strategy_id, instrument_id, side, order_type, status, quantity, price, filled_quantity) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, '')::DOUBLE PRECISION, $10) "
+        "ON CONFLICT (order_id) DO UPDATE SET "
+        "client_order_id = EXCLUDED.client_order_id, "
+        "strategy_id = EXCLUDED.strategy_id, "
+        "instrument_id = EXCLUDED.instrument_id, "
+        "side = EXCLUDED.side, "
+        "order_type = EXCLUDED.order_type, "
+        "status = EXCLUDED.status, "
+        "quantity = EXCLUDED.quantity, "
+        "price = EXCLUDED.price, "
+        "filled_quantity = EXCLUDED.filled_quantity",
+        {
+            order_id,
+            client_order_id,
+            request.strategy_id,
+            request.instrument.instrument_id,
+            std::to_string(static_cast<int>(request.side)),
+            std::to_string(static_cast<int>(request.type)),
+            std::to_string(static_cast<int>(trading::core::OrderStatus::created)),
+            std::to_string(request.quantity),
+            encode_optional_double(request.price),
+            "0",
+        });
+    PQclear(result);
+}
+
+void LibpqOrderRepository::save_order_update(const trading::core::OrderUpdate& update) {
+    auto* result = session_->exec_params(
+        "INSERT INTO order_records "
+        "(order_id, client_order_id, strategy_id, instrument_id, side, order_type, status, quantity, price, filled_quantity) "
+        "VALUES ($1, $2, '', '', 0, 1, $3, 0, NULL, $4) "
+        "ON CONFLICT (order_id) DO UPDATE SET "
+        "client_order_id = EXCLUDED.client_order_id, "
+        "status = EXCLUDED.status, "
+        "filled_quantity = EXCLUDED.filled_quantity",
+        {
+            update.order_id,
+            update.client_order_id,
+            std::to_string(static_cast<int>(update.status)),
+            std::to_string(update.filled_quantity),
+        });
+    PQclear(result);
+}
+
+std::optional<trading::storage::OrderRecord> LibpqOrderRepository::get_order(const std::string& order_id) const {
+    auto* result = session_->exec_params(
+        "SELECT order_id, client_order_id, strategy_id, instrument_id, side, order_type, status, quantity, price, filled_quantity "
+        "FROM order_records WHERE order_id = $1",
+        {
+            order_id,
+        });
+
+    if (PQntuples(result) == 0) {
+        PQclear(result);
+        return std::nullopt;
+    }
+
+    trading::storage::OrderRecord record {
+        .order_id = PQgetvalue(result, 0, 0),
+        .client_order_id = PQgetvalue(result, 0, 1),
+        .strategy_id = PQgetvalue(result, 0, 2),
+        .instrument_id = PQgetvalue(result, 0, 3),
+        .side = static_cast<trading::core::OrderSide>(std::stoi(PQgetvalue(result, 0, 4))),
+        .order_type = static_cast<trading::core::OrderType>(std::stoi(PQgetvalue(result, 0, 5))),
+        .status = static_cast<trading::core::OrderStatus>(std::stoi(PQgetvalue(result, 0, 6))),
+        .quantity = std::stod(PQgetvalue(result, 0, 7)),
+        .price = decode_optional_double(PQgetvalue(result, 0, 8)),
+        .filled_quantity = std::stod(PQgetvalue(result, 0, 9)),
+    };
+    PQclear(result);
+    return record;
+}
+
+LibpqFillRepository::LibpqFillRepository(const trading::config::PostgresConfig& config)
+    : session_(std::make_shared<LibpqSession>(config)) {}
+
+LibpqFillRepository::~LibpqFillRepository() = default;
+
+void LibpqFillRepository::append_fill(const trading::core::FillEvent& fill) {
+    auto* result = session_->exec_params(
+        "INSERT INTO fill_records "
+        "(fill_id, order_id, instrument_id, exchange, symbol, base_asset, quote_asset, tick_size, lot_size, side, price, quantity, fee) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) "
+        "ON CONFLICT (fill_id) DO NOTHING",
+        {
+            fill.fill_id,
+            fill.order_id,
+            fill.instrument.instrument_id,
+            fill.instrument.exchange,
+            fill.instrument.symbol,
+            fill.instrument.base_asset,
+            fill.instrument.quote_asset,
+            std::to_string(fill.instrument.tick_size),
+            std::to_string(fill.instrument.lot_size),
+            std::to_string(static_cast<int>(fill.side)),
+            std::to_string(fill.price),
+            std::to_string(fill.quantity),
+            std::to_string(fill.fee),
+        });
+    PQclear(result);
+}
+
+std::vector<trading::core::FillEvent> LibpqFillRepository::all_fills() const {
+    auto* result = session_->exec(
+        "SELECT fill_id, order_id, instrument_id, exchange, symbol, base_asset, quote_asset, tick_size, lot_size, side, price, quantity, fee "
+        "FROM fill_records ORDER BY sequence_id ASC");
+
+    std::vector<trading::core::FillEvent> fills;
+    fills.reserve(static_cast<std::size_t>(PQntuples(result)));
+    for (int row = 0; row < PQntuples(result); ++row) {
+        fills.push_back({
+            .fill_id = PQgetvalue(result, row, 0),
+            .order_id = PQgetvalue(result, row, 1),
+            .instrument = {
+                .instrument_id = PQgetvalue(result, row, 2),
+                .exchange = PQgetvalue(result, row, 3),
+                .symbol = PQgetvalue(result, row, 4),
+                .base_asset = PQgetvalue(result, row, 5),
+                .quote_asset = PQgetvalue(result, row, 6),
+                .tick_size = std::stod(PQgetvalue(result, row, 7)),
+                .lot_size = std::stod(PQgetvalue(result, row, 8)),
+            },
+            .side = static_cast<trading::core::OrderSide>(std::stoi(PQgetvalue(result, row, 9))),
+            .price = std::stod(PQgetvalue(result, row, 10)),
+            .quantity = std::stod(PQgetvalue(result, row, 11)),
+            .fee = std::stod(PQgetvalue(result, row, 12)),
+        });
+    }
+
+    PQclear(result);
+    return fills;
+}
+
+LibpqPositionRepository::LibpqPositionRepository(const trading::config::PostgresConfig& config)
+    : session_(std::make_shared<LibpqSession>(config)) {}
+
+LibpqPositionRepository::~LibpqPositionRepository() = default;
+
+void LibpqPositionRepository::save_position(const trading::core::Position& position) {
+    auto* result = session_->exec_params(
+        "INSERT INTO position_records "
+        "(instrument_id, position_id, exchange, symbol, base_asset, quote_asset, tick_size, lot_size, net_quantity, average_entry_price, realized_pnl, unrealized_pnl) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) "
+        "ON CONFLICT (instrument_id) DO UPDATE SET "
+        "position_id = EXCLUDED.position_id, "
+        "exchange = EXCLUDED.exchange, "
+        "symbol = EXCLUDED.symbol, "
+        "base_asset = EXCLUDED.base_asset, "
+        "quote_asset = EXCLUDED.quote_asset, "
+        "tick_size = EXCLUDED.tick_size, "
+        "lot_size = EXCLUDED.lot_size, "
+        "net_quantity = EXCLUDED.net_quantity, "
+        "average_entry_price = EXCLUDED.average_entry_price, "
+        "realized_pnl = EXCLUDED.realized_pnl, "
+        "unrealized_pnl = EXCLUDED.unrealized_pnl",
+        {
+            position.instrument.instrument_id,
+            position.position_id,
+            position.instrument.exchange,
+            position.instrument.symbol,
+            position.instrument.base_asset,
+            position.instrument.quote_asset,
+            std::to_string(position.instrument.tick_size),
+            std::to_string(position.instrument.lot_size),
+            std::to_string(position.net_quantity),
+            std::to_string(position.average_entry_price),
+            std::to_string(position.realized_pnl),
+            std::to_string(position.unrealized_pnl),
+        });
+    PQclear(result);
+}
+
+std::optional<trading::core::Position> LibpqPositionRepository::get_position(const std::string& instrument_id) const {
+    auto* result = session_->exec_params(
+        "SELECT position_id, instrument_id, exchange, symbol, base_asset, quote_asset, tick_size, lot_size, net_quantity, average_entry_price, realized_pnl, unrealized_pnl "
+        "FROM position_records WHERE instrument_id = $1",
+        {
+            instrument_id,
+        });
+
+    if (PQntuples(result) == 0) {
+        PQclear(result);
+        return std::nullopt;
+    }
+
+    trading::core::Position position {
+        .position_id = PQgetvalue(result, 0, 0),
+        .instrument = {
+            .instrument_id = PQgetvalue(result, 0, 1),
+            .exchange = PQgetvalue(result, 0, 2),
+            .symbol = PQgetvalue(result, 0, 3),
+            .base_asset = PQgetvalue(result, 0, 4),
+            .quote_asset = PQgetvalue(result, 0, 5),
+            .tick_size = std::stod(PQgetvalue(result, 0, 6)),
+            .lot_size = std::stod(PQgetvalue(result, 0, 7)),
+        },
+        .net_quantity = std::stod(PQgetvalue(result, 0, 8)),
+        .average_entry_price = std::stod(PQgetvalue(result, 0, 9)),
+        .realized_pnl = std::stod(PQgetvalue(result, 0, 10)),
+        .unrealized_pnl = std::stod(PQgetvalue(result, 0, 11)),
+    };
+    PQclear(result);
+    return position;
 }
 
 }  // namespace trading::infrastructure

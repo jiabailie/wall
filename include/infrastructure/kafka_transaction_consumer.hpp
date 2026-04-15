@@ -1,12 +1,16 @@
 #pragma once
 
+#include "config/app_config.hpp"
 #include "ingestion/transaction_consumer.hpp"
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace trading::infrastructure {
+
+class RdKafkaConsumerHandle;
 
 // Stores one raw Kafka message as consumed by the low-level client.
 struct RawKafkaMessage {
@@ -46,6 +50,21 @@ private:
 
     IKafkaConsumerClient& client_;
     std::string transaction_topic_;
+};
+
+// librdkafka-backed low-level Kafka consumer client.
+class RdKafkaConsumerClient final : public IKafkaConsumerClient {
+public:
+    explicit RdKafkaConsumerClient(const trading::config::KafkaConfig& config, int poll_timeout_ms = 100);
+    ~RdKafkaConsumerClient();
+
+    std::optional<RawKafkaMessage> poll() override;
+    void commit(const std::string& topic, int partition, std::int64_t offset) override;
+
+private:
+    std::shared_ptr<RdKafkaConsumerHandle> handle_;
+    std::string transaction_topic_;
+    int poll_timeout_ms_ {100};
 };
 
 }  // namespace trading::infrastructure

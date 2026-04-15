@@ -5,6 +5,26 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(HIREDIS REQUIRED IMPORTED_TARGET hiredis)
+pkg_check_modules(RDKAFKA REQUIRED IMPORTED_TARGET rdkafka)
+find_path(LIBPQ_INCLUDE_DIR
+    NAMES libpq-fe.h
+    PATHS
+        /opt/homebrew/opt/libpq/include
+        /usr/local/opt/libpq/include
+)
+find_library(LIBPQ_LIBRARY
+    NAMES pq libpq
+    PATHS
+        /opt/homebrew/opt/libpq/lib
+        /usr/local/opt/libpq/lib
+)
+
+if(NOT LIBPQ_INCLUDE_DIR OR NOT LIBPQ_LIBRARY)
+    message(FATAL_ERROR "libpq headers or library were not found")
+endif()
+
 add_library(trading_engine
     src/app/application.cpp
     src/app/engine_controller.cpp
@@ -32,11 +52,20 @@ add_library(trading_engine
 target_include_directories(trading_engine
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${LIBPQ_INCLUDE_DIR}
 )
 
 target_compile_definitions(trading_engine
     PUBLIC
         TRADING_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+target_link_libraries(trading_engine
+    PRIVATE
+        ${LIBPQ_LIBRARY}
+        PkgConfig::HIREDIS
+        PkgConfig::RDKAFKA
 )
 
 add_executable(wall main.cpp)
