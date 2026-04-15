@@ -1,6 +1,7 @@
 #include "app/engine_controller.hpp"
 #include "app/mock_event_sources.hpp"
 #include "app/simulation_runtime.hpp"
+#include "app/transaction_publisher_application.hpp"
 #include "config/config_loader.hpp"
 #include "core/clock.hpp"
 #include "core/event_dispatcher.hpp"
@@ -10,6 +11,7 @@
 #include "execution/simulated_execution_engine.hpp"
 #include "infrastructure/postgres_repositories.hpp"
 #include "infrastructure/kafka_transaction_consumer.hpp"
+#include "infrastructure/kafka_transaction_producer.hpp"
 #include "infrastructure/redis_cache.hpp"
 #include "ingestion/transaction_consumer.hpp"
 #include "ingestion/transaction_ingestor.hpp"
@@ -1539,6 +1541,40 @@ void test_kafka_transaction_consumer_commit_checkpoint_behavior() {
     expect_equal(fake_client.commits()[0].offset, std::int64_t {77}, "committed offset should match payload");
 }
 
+// Verifies producer payload serialization matches the consumer-side key-value schema.
+void test_kafka_transaction_producer_serializes_payload() {
+    const auto command = make_transaction("tx-serializer", 0);
+
+    const auto payload = trading::infrastructure::serialize_transaction_command_payload(command);
+    expect_true(payload.find("transaction_id=tx-serializer") != std::string::npos, "payload should contain transaction id");
+    expect_true(payload.find("user_id=user-1") != std::string::npos, "payload should contain user id");
+    expect_true(payload.find("instrument_symbol=BTCUSDT") != std::string::npos, "payload should contain instrument symbol");
+    expect_true(payload.find("quantity=1.5") != std::string::npos, "payload should contain quantity");
+    expect_true(payload.find("price=42000") != std::string::npos, "payload should contain price");
+}
+
+// Verifies the transaction publisher can parse one flat JSON input line.
+void test_transaction_publisher_parses_json_line() {
+    const auto command = trading::app::parse_json_transaction_command_line(
+        R"({"transaction_id":"tx-2001","user_id":"user-9","account_id":"account-9","command_type":"place_order","instrument_symbol":"ETHUSDT","quantity":1.25,"price":3200.5})");
+
+    expect_true(command.has_value(), "json transaction line should parse");
+    expect_equal(command->transaction_id, std::string("tx-2001"), "parsed transaction id should match");
+    expect_equal(command->user_id, std::string("user-9"), "parsed user id should match");
+    expect_equal(command->instrument_symbol, std::string("ETHUSDT"), "parsed instrument should match");
+    expect_equal(command->quantity, 1.25, "parsed quantity should match");
+    expect_true(command->price.has_value(), "parsed price should exist");
+    expect_equal(*command->price, 3200.5, "parsed price should match");
+}
+
+// Verifies malformed JSON transaction lines are rejected safely.
+void test_transaction_publisher_rejects_invalid_json_line() {
+    const auto command = trading::app::parse_json_transaction_command_line(
+        R"({"transaction_id":"tx-2001","user_id":"user-9","quantity":"oops"})");
+
+    expect_true(!command.has_value(), "invalid json transaction line should be rejected");
+}
+
 // Verifies Kafka-style transaction consumption preserves order and commit checkpoints.
 void test_transaction_ingestor_order_and_commit() {
     trading::core::EventDispatcher dispatcher;
@@ -1718,6 +1754,9 @@ int main() {
         {"kafka_transaction_consumer_parses_payload", test_kafka_transaction_consumer_parses_payload},
         {"kafka_transaction_consumer_skips_malformed_messages", test_kafka_transaction_consumer_skips_malformed_messages},
         {"kafka_transaction_consumer_commit_checkpoint_behavior", test_kafka_transaction_consumer_commit_checkpoint_behavior},
+        {"kafka_transaction_producer_serializes_payload", test_kafka_transaction_producer_serializes_payload},
+        {"transaction_publisher_parses_json_line", test_transaction_publisher_parses_json_line},
+        {"transaction_publisher_rejects_invalid_json_line", test_transaction_publisher_rejects_invalid_json_line},
         {"transaction_ingestor_order_and_commit", test_transaction_ingestor_order_and_commit},
         {"transaction_ingestor_rejects_invalid_messages", test_transaction_ingestor_rejects_invalid_messages},
         {"exchange_adapter_stub_integration", test_exchange_adapter_stub_integration},

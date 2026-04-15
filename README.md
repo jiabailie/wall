@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project is a C++20 crypto trading engine scaffold designed around an event-driven architecture.
+This project is a C++20 crypto trading engine prototype designed around an event-driven architecture.
 
 The current implementation provides:
 
@@ -10,11 +10,13 @@ The current implementation provides:
 - a deterministic event dispatcher
 - a market state store for real-time instrument state
 - a Kafka-style transaction ingestion pipeline that processes transactions one by one
-- storage abstractions for Redis-style cache usage and PostgreSQL-style durable persistence
+- a Kafka transaction producer application that reads JSONL transaction requests and publishes them to Kafka
+- storage abstractions plus native Redis, PostgreSQL, and Kafka adapters
+- an end-to-end simulated trading path with strategy, risk, execution, portfolio, and replay support
 - local Docker infrastructure definitions for Redis, PostgreSQL, and Kafka
-- unit tests with mock data for the current foundation layer
+- unit tests for the current simulation and infrastructure boundary layer
 
-The current codebase is the Phase 1 foundation plus the initial Kafka ingestion slice. It is not yet a full live trading engine.
+The current codebase is beyond the initial scaffold stage, but it is not yet a full live trading engine. Live exchange connectivity, reconciliation, and production runtime wiring are still incomplete.
 
 ## Quick Start
 
@@ -26,6 +28,7 @@ cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ./build/wall
+./build/wall_tx_producer configs/sample_transactions.jsonl
 ```
 
 To stop the local environment:
@@ -277,6 +280,8 @@ This creates:
 
 - `build/wall`
 - `build/wall_tests`
+- `build/wall_replay`
+- `build/wall_tx_producer`
 
 ### Step 4: Run Unit Tests
 
@@ -292,28 +297,42 @@ The current tests verify:
 - configuration loading and environment overrides
 - event dispatcher ordering
 - market state updates and stale checks
+- strategy, risk, execution, and portfolio behavior
+- replay behavior
 - Kafka-style sequential transaction ingestion
+- producer payload serialization and JSON transaction parsing
 - invalid transaction rejection behavior
 
-### Step 5: Optionally Send Sample Transactions To Kafka
+### Step 5: Publish Transactions To Kafka
 
 Sample transaction fixtures are stored in:
 
 - [sample_transactions.jsonl](/Users/yangruiguo/Documents/wall/configs/sample_transactions.jsonl)
 
-Publish the default sample data into Kafka:
+Publish the default sample data into Kafka with the C++ producer application:
+
+```bash
+./build/wall_tx_producer configs/sample_transactions.jsonl
+```
+
+Or stream transactions from standard input:
+
+```bash
+cat configs/sample_transactions.jsonl | ./build/wall_tx_producer
+```
+
+The producer application:
+
+- reads line-delimited JSON transaction requests
+- parses them into `TransactionCommand` values
+- serializes them into the key-value payload schema consumed by the Kafka ingestion path
+- publishes them into the configured Kafka topic using `librdkafka`
+
+The existing shell helper is still available for container-driven manual publishing:
 
 ```bash
 bash scripts/send_sample_transactions.sh
 ```
-
-Or publish a custom file and topic:
-
-```bash
-bash scripts/send_sample_transactions.sh configs/sample_transactions.jsonl trading-transactions
-```
-
-This step is optional for the current scaffold, because the current C++ program does not yet include a real Kafka client. It is still useful for validating the local Kafka container and preparing for the next implementation step.
 
 ### Step 6: Start The Program
 
@@ -327,13 +346,13 @@ Expected behavior in the current scaffold:
 
 - the program loads [development.cfg](/Users/yangruiguo/Documents/wall/configs/development.cfg)
 - validates Redis, PostgreSQL, and Kafka configuration
-- prints a startup line with mode, exchange, and Kafka topic
+- runs a single mock-driven simulation cycle
+- logs processed market, transaction, and timer events
+- writes a replayable event log
 
 Example:
 
-```text
-Trading engine scaffold started in mode=paper, exchange=binance, kafka_topic=trading-transactions
-```
+The current engine executable is still a development-oriented bootstrap, not a long-running live trading process.
 
 ### Step 7: Shut Everything Down
 
@@ -355,8 +374,9 @@ Container role:
 Current status:
 
 - Docker service is available
-- sample producer helper is available
-- real C++ Kafka consumer is not implemented yet
+- C++ transaction producer application is available
+- native Kafka consumer and producer adapters are implemented
+- live engine wiring to consume Kafka continuously is still incomplete
 
 ### Redis
 
@@ -368,7 +388,8 @@ Container role:
 Current status:
 
 - Docker service is available
-- real C++ Redis client is not implemented yet
+- native Redis-backed cache adapters are implemented
+- the main runtime is not yet fully wired to use Redis in end-to-end live mode
 
 ### PostgreSQL
 
@@ -380,7 +401,8 @@ Container role:
 Current status:
 
 - Docker service is available
-- real C++ PostgreSQL repository is not implemented yet
+- native PostgreSQL-backed repository adapters are implemented
+- the main runtime is not yet fully wired to use PostgreSQL in end-to-end live mode
 
 ## How To Send Sample Transactions To Kafka
 
@@ -388,7 +410,11 @@ Sample transaction fixtures are stored in:
 
 - [sample_transactions.jsonl](/Users/yangruiguo/Documents/wall/configs/sample_transactions.jsonl)
 
-A helper script is available at:
+A C++ producer executable is available after building the project:
+
+- `build/wall_tx_producer`
+
+A shell helper is also available at:
 
 - [send_sample_transactions.sh](/Users/yangruiguo/Documents/wall/scripts/send_sample_transactions.sh)
 
@@ -398,28 +424,28 @@ Before using it, start the Docker infrastructure:
 docker compose -f docker/docker-compose.yml up -d
 ```
 
-Then publish the default sample transactions:
+Then publish the default sample transactions with the C++ producer:
 
 ```bash
-bash scripts/send_sample_transactions.sh
+./build/wall_tx_producer configs/sample_transactions.jsonl
 ```
 
-You can also publish a different file or topic:
+You can also use standard input:
 
 ```bash
-bash scripts/send_sample_transactions.sh configs/sample_transactions.jsonl trading-transactions
+cat configs/sample_transactions.jsonl | ./build/wall_tx_producer
 ```
 
-The helper script:
+The producer application:
 
 - reads line-delimited JSON transactions from a local file
+- parses each line into a transaction command
+- publishes each command to the configured Kafka topic using `librdkafka`
+
+The shell helper script:
+
 - opens `kafka-console-producer` inside the Kafka container
-- writes each line into the Kafka topic
-
-Current note:
-
-- the C++ scaffold does not yet connect to a real Kafka client
-- this helper is for local infrastructure testing and manual message injection
+- writes each line into the Kafka topic without C++ parsing
 
 ## Configuration
 
@@ -449,27 +475,33 @@ Implemented:
 - config loader
 - event dispatcher
 - market state store
-- Kafka-style transaction ingestion interfaces
+- sample strategy
+- baseline risk engine
+- simulated execution engine
+- portfolio and PnL service
+- replay service
+- Kafka transaction ingestion interfaces and native Kafka consumer client
+- native Kafka transaction producer application
 - in-memory repository and cache scaffolding
+- native Redis cache adapters
+- native PostgreSQL repository adapters
 - local Docker stack
 - unit tests with mock data
 
 Not implemented yet:
 
-- real Kafka client integration
-- real Redis client integration
-- real PostgreSQL repository implementation
-- strategy engine
-- risk engine
-- simulated execution engine
 - live exchange adapter
+- long-running live runtime wiring
+- startup reconciliation and restart recovery
+- production-grade operational controls
+- metrics and alerting
 
 ## Next Steps
 
 The next development slice should add:
 
-1. strategy interfaces
-2. risk validation
-3. simulated execution
-4. portfolio accounting
-5. real Redis, PostgreSQL, and Kafka adapter implementations
+1. wire the native Kafka, Redis, and PostgreSQL adapters into a real runtime path
+2. replace mock event sources with real live ingestion and market-data flows
+3. add startup reconciliation and restart recovery
+4. add a first real exchange adapter
+5. add operational controls and metrics

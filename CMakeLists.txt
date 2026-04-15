@@ -30,12 +30,14 @@ add_library(trading_engine
     src/app/engine_controller.cpp
     src/app/mock_event_sources.cpp
     src/app/simulation_runtime.cpp
+    src/app/transaction_publisher_application.cpp
     src/config/config_loader.cpp
     src/exchange/exchange_execution_adapter.cpp
     src/exchange/exchange_market_data_adapter.cpp
     src/execution/simulated_execution_engine.cpp
     src/infrastructure/postgres_repositories.cpp
     src/infrastructure/kafka_transaction_consumer.cpp
+    src/infrastructure/kafka_transaction_producer.cpp
     src/infrastructure/redis_cache.cpp
     src/ingestion/transaction_consumer.cpp
     src/ingestion/transaction_ingestor.cpp
@@ -76,6 +78,9 @@ target_link_libraries(wall_tests PRIVATE trading_engine)
 
 add_executable(wall_replay src/tools/replay_main.cpp)
 target_link_libraries(wall_replay PRIVATE trading_engine)
+
+add_executable(wall_tx_producer src/tools/transaction_producer_main.cpp)
+target_link_libraries(wall_tx_producer PRIVATE trading_engine)
 
 enable_testing()
 add_test(NAME wall_tests COMMAND wall_tests)
