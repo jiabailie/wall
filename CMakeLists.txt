@@ -48,6 +48,7 @@ add_library(trading_engine
     src/market_data/market_state_store.cpp
     src/monitoring/health_status.cpp
     src/monitoring/logger.cpp
+    src/monitoring/metrics.cpp
     src/portfolio/portfolio_service.cpp
     src/risk/risk_engine.cpp
     src/storage/replay_service.cpp

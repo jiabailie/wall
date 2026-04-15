@@ -4,6 +4,8 @@ namespace trading::ingestion {
 
 // Polls one transaction, validates it, persists state transitions, and publishes it into the runtime.
 bool TransactionIngestor::process_next() const {
+    const auto started_ms = clock_ != nullptr ? clock_->now_ms() : 0;
+
     // Step 1: Poll the next transaction command from the consumer.
     const auto command = consumer_.poll();
     if (!command.has_value()) {
@@ -11,14 +13,37 @@ bool TransactionIngestor::process_next() const {
     }
 
     // Step 2: Persist receipt before any engine-side processing.
-    repository_.save_received(*command);
+    try {
+        repository_.save_received(*command);
+    } catch (...) {
+        if (metrics_ != nullptr) {
+            metrics_->increment("persistence_failures");
+        }
+        throw;
+    }
     cache_.set_status(command->transaction_id, "received");
+    if (metrics_ != nullptr) {
+        metrics_->increment("transactions_received");
+    }
 
     // Step 3: Reject invalid commands without publishing them into the runtime.
     if (!is_valid(*command)) {
-        repository_.save_processed(command->transaction_id, "rejected");
+        try {
+            repository_.save_processed(command->transaction_id, "rejected");
+        } catch (...) {
+            if (metrics_ != nullptr) {
+                metrics_->increment("persistence_failures");
+            }
+            throw;
+        }
         cache_.set_status(command->transaction_id, "rejected");
         consumer_.commit(*command);
+        if (metrics_ != nullptr) {
+            metrics_->increment("transactions_rejected");
+            if (clock_ != nullptr) {
+                metrics_->observe_latency("transaction_processing_latency_ms", clock_->now_ms() - started_ms);
+            }
+        }
         return true;
     }
 
@@ -26,9 +51,22 @@ bool TransactionIngestor::process_next() const {
     dispatcher_.publish(*command);
 
     // Step 5: Persist successful processing and commit the consumed offset.
-    repository_.save_processed(command->transaction_id, "processed");
+    try {
+        repository_.save_processed(command->transaction_id, "processed");
+    } catch (...) {
+        if (metrics_ != nullptr) {
+            metrics_->increment("persistence_failures");
+        }
+        throw;
+    }
     cache_.set_status(command->transaction_id, "processed");
     consumer_.commit(*command);
+    if (metrics_ != nullptr) {
+        metrics_->increment("transactions_processed");
+        if (clock_ != nullptr) {
+            metrics_->observe_latency("transaction_processing_latency_ms", clock_->now_ms() - started_ms);
+        }
+    }
     return true;
 }
 

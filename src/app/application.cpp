@@ -12,6 +12,7 @@
 #include "infrastructure/redis_cache.hpp"
 #include "monitoring/health_status.hpp"
 #include "monitoring/logger.hpp"
+#include "monitoring/metrics.hpp"
 #include "storage/replay_service.hpp"
 
 #include <filesystem>
@@ -53,6 +54,8 @@ void Application::run() {
     trading::app::EngineController controller(clock);
     trading::monitoring::ConsoleStructuredLogger logger(std::cout);
     trading::monitoring::RuntimeHealthStatus health_status;
+    trading::monitoring::InMemoryMetricsCollector metrics;
+    trading::app::RuntimeOperationalControls controls;
     const auto event_log_path = std::filesystem::temp_directory_path() / "wall-runtime-events.tsv";
     const auto local_state_root = std::filesystem::temp_directory_path() / "wall-local-state";
     trading::storage::ReplayService replay_service(event_log_path);
@@ -174,7 +177,9 @@ void Application::run() {
                 .partial_fill_ratio = config.simulation.partial_fill_ratio,
             },
             .auto_complete_partial_fills = config.simulation.auto_complete_partial_fills,
-        });
+        },
+        &controls,
+        &metrics);
 
     trading::app::RecoveryService recovery_service(
         *transaction_repository,
@@ -276,6 +281,10 @@ void Application::run() {
             {"infrastructure_mode", infrastructure_mode},
             {"infrastructure_fallback_reason", infrastructure_fallback_reason.empty() ? "none" : infrastructure_fallback_reason},
             {"health_overall", trading::monitoring::to_string(health_status.overall_status())},
+            {"metric_transaction_events", std::to_string(metrics.counter("transaction_events"))},
+            {"metric_risk_rejects", std::to_string(metrics.counter("risk_rejects"))},
+            {"metric_fills_applied", std::to_string(metrics.counter("fills_applied"))},
+            {"metric_runtime_event_latency_max_ms", std::to_string(metrics.latency("runtime_event_latency_ms").max_ms)},
             {"event_log_path", event_log_path.string()},
             {"exchange_adapter_supports_cancel", execution_capabilities.supports_cancel ? "true" : "false"},
             {"exchange_adapter_supports_replace", execution_capabilities.supports_replace ? "true" : "false"},

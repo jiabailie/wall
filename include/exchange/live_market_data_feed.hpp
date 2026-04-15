@@ -1,5 +1,7 @@
 #pragma once
 
+#include "monitoring/metrics.hpp"
+
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -21,10 +23,12 @@ class LiveMarketDataFeedController {
 public:
     LiveMarketDataFeedController(IMarketDataFeedSession& session,
                                  std::vector<std::string> symbols,
-                                 std::size_t max_reconnect_attempts)
+                                 std::size_t max_reconnect_attempts,
+                                 trading::monitoring::IMetricsCollector* metrics = nullptr)
         : session_(session),
           symbols_(std::move(symbols)),
-          max_reconnect_attempts_(max_reconnect_attempts) {}
+          max_reconnect_attempts_(max_reconnect_attempts),
+          metrics_(metrics) {}
 
     void start();
     void handle_disconnect();
@@ -38,6 +42,7 @@ private:
     std::size_t max_reconnect_attempts_ {0};
     std::size_t reconnect_attempts_ {0};
     bool connected_ {false};
+    trading::monitoring::IMetricsCollector* metrics_ {nullptr};
 };
 
 // Test-friendly session double for reconnect and resubscribe workflows.
