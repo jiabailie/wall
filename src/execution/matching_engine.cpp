@@ -1,10 +1,17 @@
 #include "execution/matching_engine.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 #include <utility>
 
 namespace trading::execution {
+
+namespace {
+
+constexpr double kQuantityTolerance = 1e-9;
+
+}  // namespace
 
 ExecutionResult MatchingEngine::submit(const trading::core::OrderRequest& request) {
     std::stringstream order_id_builder;
@@ -60,7 +67,7 @@ ExecutionResult MatchingEngine::submit(const trading::core::OrderRequest& reques
         0.0));
 
     double remaining_quantity = request.quantity;
-    while (remaining_quantity > 0.0) {
+    while (remaining_quantity > kQuantityTolerance) {
         const auto resting_order = request.side == trading::core::OrderSide::buy
             ? book.best_ask_order()
             : book.best_bid_order();
@@ -83,24 +90,34 @@ ExecutionResult MatchingEngine::submit(const trading::core::OrderRequest& reques
             .quantity = executed_quantity,
             .fee = 0.0,
         });
-        remaining_quantity -= executed_quantity;
+        remaining_quantity = std::max(0.0, remaining_quantity - executed_quantity);
     }
 
-    const auto filled_quantity = request.quantity - remaining_quantity;
+    const auto filled_quantity = std::max(0.0, request.quantity - remaining_quantity);
     orders_[result.order_id].filled_quantity = filled_quantity;
-    if (remaining_quantity > 0.0) {
+    if (remaining_quantity > kQuantityTolerance) {
         const auto rested = book.add_order(request, result.order_id, result.client_order_id, filled_quantity);
-        static_cast<void>(rested);
+        if (!rested) {
+            orders_[result.order_id].status = trading::core::OrderStatus::rejected;
+            result.updates.push_back(make_update(
+                result.order_id,
+                result.client_order_id,
+                trading::core::OrderStatus::rejected,
+                filled_quantity,
+                "failed to rest residual order quantity"));
+            return result;
+        }
     }
 
-    if (filled_quantity == request.quantity) {
+    if (std::abs(filled_quantity - request.quantity) <= kQuantityTolerance) {
+        orders_[result.order_id].filled_quantity = request.quantity;
         orders_[result.order_id].status = trading::core::OrderStatus::filled;
         result.updates.push_back(make_update(
             result.order_id,
             result.client_order_id,
             trading::core::OrderStatus::filled,
             filled_quantity));
-    } else if (filled_quantity > 0.0) {
+    } else if (filled_quantity > kQuantityTolerance) {
         orders_[result.order_id].status = trading::core::OrderStatus::partially_filled;
         result.updates.push_back(make_update(
             result.order_id,
@@ -171,6 +188,13 @@ void MatchingEngine::restore_open_order(const std::string& order_id,
                                         const std::string& client_order_id,
                                         const trading::core::OrderRequest& request,
                                         const double filled_quantity) {
+    if (!request.price.has_value() || *request.price <= 0.0 || request.quantity <= 0.0) {
+        return;
+    }
+    if (filled_quantity < 0.0 || filled_quantity >= (request.quantity - kQuantityTolerance)) {
+        return;
+    }
+
     orders_[order_id] = trading::storage::OrderRecord {
         .order_id = order_id,
         .client_order_id = client_order_id,
@@ -187,7 +211,9 @@ void MatchingEngine::restore_open_order(const std::string& order_id,
     };
     auto& book = book_for(request.instrument);
     const auto restored = book.add_order(request, order_id, client_order_id, filled_quantity);
-    static_cast<void>(restored);
+    if (!restored) {
+        orders_.erase(order_id);
+    }
 }
 
 std::optional<trading::storage::OrderRecord> MatchingEngine::get_order(const std::string& order_id) const {
@@ -248,13 +274,16 @@ bool MatchingEngine::is_terminal(const trading::core::OrderStatus status) const 
 
 void MatchingEngine::apply_fill_to_order(const std::string& order_id, const double executed_quantity) {
     const auto iterator = orders_.find(order_id);
-    if (iterator == orders_.end() || executed_quantity <= 0.0) {
+    if (iterator == orders_.end() || executed_quantity <= kQuantityTolerance) {
         return;
     }
 
     auto& order = iterator->second;
     order.filled_quantity = std::min(order.quantity, order.filled_quantity + executed_quantity);
-    order.status = order.filled_quantity >= order.quantity
+    if (std::abs(order.filled_quantity - order.quantity) <= kQuantityTolerance) {
+        order.filled_quantity = order.quantity;
+    }
+    order.status = order.filled_quantity >= (order.quantity - kQuantityTolerance)
         ? trading::core::OrderStatus::filled
         : trading::core::OrderStatus::partially_filled;
 }
