@@ -798,6 +798,54 @@ void test_sample_threshold_strategy_no_order_without_trigger() {
     expect_true(requests.empty(), "strategy should not emit when trigger condition is not met");
 }
 
+// Verifies emitted orders inherit full market-event instrument metadata when config is sparse.
+void test_sample_threshold_strategy_propagates_full_instrument_metadata() {
+    trading::core::FixedClock clock(5000);
+    trading::market_data::MarketStateStore store(clock);
+    const auto instrument = make_btc_instrument();
+
+    store.apply(trading::core::MarketEvent {
+        .event_id = "market-1",
+        .type = trading::core::MarketEventType::trade,
+        .instrument = instrument,
+        .price = 41990.0,
+        .quantity = 0.5,
+        .process_timestamp = 4900,
+    });
+
+    trading::strategy::SampleThresholdStrategy strategy({
+        .strategy_id = "threshold-1",
+        .instrument_id = instrument.instrument_id,
+        .instrument = {
+            .instrument_id = instrument.instrument_id,
+        },
+        .trigger_price = 42000.0,
+        .order_quantity = 0.25,
+        .side = trading::core::OrderSide::buy,
+    });
+    const trading::strategy::StrategyContext context {
+        .market_state_store = store,
+        .clock = clock,
+    };
+
+    log_test_step("emit threshold-strategy order from sparse configured instrument");
+    const auto requests = strategy.on_event(trading::core::MarketEvent {
+        .event_id = "market-2",
+        .type = trading::core::MarketEventType::trade,
+        .instrument = instrument,
+        .price = 41990.0,
+        .quantity = 0.25,
+        .process_timestamp = 4901,
+    }, context);
+
+    log_test_step("verify emitted order carries full instrument metadata");
+    expect_equal(requests.size(), std::size_t {1}, "strategy should emit one order");
+    expect_equal(requests[0].instrument.exchange, std::string("binance"), "emitted order should carry exchange metadata");
+    expect_equal(requests[0].instrument.symbol, std::string("BTCUSDT"), "emitted order should carry symbol metadata");
+    expect_equal(requests[0].instrument.base_asset, std::string("BTC"), "emitted order should carry base-asset metadata");
+    expect_equal(requests[0].instrument.quote_asset, std::string("USDT"), "emitted order should carry quote-asset metadata");
+}
+
 // Verifies a transaction command can reset the sample strategy after a prior signal.
 void test_sample_threshold_strategy_reset_command() {
     trading::core::FixedClock clock(5000);
@@ -2901,6 +2949,211 @@ void test_recovery_service_resumes_kafka_from_next_offset() {
     expect_equal(kafka_client.seeks()[0].offset, std::int64_t {78}, "recovery should seek to the next offset");
 }
 
+// Verifies runtime persists local open-order state, fills, portfolio, and market snapshots for recovery.
+void test_simulation_runtime_persists_local_state_for_recovery() {
+    trading::core::FixedClock clock(5000);
+    trading::storage::InMemoryOrderRepository order_repository;
+    trading::storage::InMemoryFillRepository fill_repository;
+    trading::storage::InMemoryPositionRepository position_repository;
+    trading::storage::InMemoryBalanceRepository balance_repository;
+    trading::storage::InMemoryMarketStateCache market_cache;
+
+    trading::app::SimulationRuntime runtime(
+        clock,
+        {
+            .max_order_quantity = 1.0,
+            .max_order_notional = 50000.0,
+            .max_position_quantity = 2.0,
+            .stale_after_ms = 1000,
+            .kill_switch_enabled = false,
+        },
+        {
+            .strategy = {
+                .strategy_id = "threshold-1",
+                .instrument_id = "binance:BTCUSDT",
+                .instrument = make_btc_instrument(),
+                .trigger_price = 42000.0,
+                .order_quantity = 0.4,
+                .side = trading::core::OrderSide::buy,
+            },
+            .execution = {
+                .partial_fill_threshold = 1.0,
+                .partial_fill_ratio = 0.5,
+            },
+            .auto_complete_partial_fills = false,
+            .order_repository = &order_repository,
+            .fill_repository = &fill_repository,
+            .position_repository = &position_repository,
+            .balance_repository = &balance_repository,
+            .market_state_cache = &market_cache,
+        });
+
+    log_test_step("process trade event that creates a resting local buy order");
+    runtime.on_event(trading::core::MarketEvent {
+        .event_id = "trade-1",
+        .type = trading::core::MarketEventType::trade,
+        .instrument = make_btc_instrument(),
+        .price = 41990.0,
+        .quantity = 0.5,
+        .process_timestamp = 4900,
+    });
+
+    log_test_step("verify resting open order and cached market snapshot were persisted");
+    const auto open_orders = order_repository.all_open_orders();
+    expect_equal(open_orders.size(), std::size_t {1}, "one resting local order should persist as open");
+    expect_equal(open_orders[0].status, trading::core::OrderStatus::acknowledged, "resting local order should persist as acknowledged");
+    const auto cached_trade_snapshot = market_cache.get_snapshot("binance:BTCUSDT");
+    expect_true(cached_trade_snapshot.has_value(), "market snapshot should be persisted to cache");
+    expect_true(cached_trade_snapshot->last_trade_price.has_value(), "persisted market snapshot should retain last trade price");
+    expect_equal(*cached_trade_snapshot->last_trade_price, 41990.0, "persisted trade price should match event");
+
+    log_test_step("process book snapshot that fills the persisted resting order");
+    runtime.on_event(trading::core::MarketEvent {
+        .event_id = "book-1",
+        .type = trading::core::MarketEventType::book_snapshot,
+        .instrument = make_btc_instrument(),
+        .ask_levels = {
+            {.price = 41990.0, .quantity = 0.4},
+        },
+        .process_timestamp = 4901,
+    });
+
+    log_test_step("verify filled order, persisted fill, portfolio, and book snapshot state");
+    const auto filled_order = order_repository.get_order(open_orders[0].order_id);
+    expect_true(filled_order.has_value(), "filled local order should remain persisted");
+    expect_equal(filled_order->status, trading::core::OrderStatus::filled, "filled local order should persist terminal status");
+    expect_equal(fill_repository.all_fills().size(), std::size_t {1}, "one market-driven fill should be persisted");
+    const auto persisted_position = position_repository.get_position("binance:BTCUSDT");
+    expect_true(persisted_position.has_value(), "position should be persisted after fill");
+    expect_near(persisted_position->net_quantity, 0.4, 1e-9, "persisted position quantity should match fill");
+    const auto persisted_balance = balance_repository.get_balance("BTC");
+    expect_true(persisted_balance.has_value(), "base-asset balance should be persisted after fill");
+    expect_near(persisted_balance->total_balance, 0.4, 1e-9, "persisted base balance should reflect fill quantity");
+    const auto cached_book_snapshot = market_cache.get_snapshot("binance:BTCUSDT");
+    expect_true(cached_book_snapshot.has_value(), "book snapshot should persist to market cache");
+    expect_true(cached_book_snapshot->best_ask.has_value(), "persisted book snapshot should retain best ask");
+    expect_equal(*cached_book_snapshot->best_ask, 41990.0, "persisted best ask should match book snapshot");
+}
+
+// Verifies recovery restores persisted local open orders and matching can continue after restart.
+void test_recovery_service_restores_local_open_order_continuity() {
+    trading::storage::InMemoryTransactionRepository transaction_repository;
+    trading::storage::InMemoryOrderRepository order_repository;
+    trading::storage::InMemoryPositionRepository position_repository;
+    trading::storage::InMemoryBalanceRepository balance_repository;
+    trading::storage::InMemoryMarketStateCache market_cache;
+    trading::storage::InMemoryTransactionCache transaction_cache;
+
+    {
+        trading::core::FixedClock first_clock(5000);
+        trading::app::SimulationRuntime first_runtime(
+            first_clock,
+            {
+                .max_order_quantity = 1.0,
+                .max_order_notional = 50000.0,
+                .max_position_quantity = 2.0,
+                .stale_after_ms = 1000,
+                .kill_switch_enabled = false,
+            },
+            {
+                .strategy = {
+                    .strategy_id = "threshold-1",
+                    .instrument_id = "binance:BTCUSDT",
+                    .instrument = make_btc_instrument(),
+                    .trigger_price = 42000.0,
+                    .order_quantity = 0.4,
+                    .side = trading::core::OrderSide::buy,
+                },
+                .execution = {
+                    .partial_fill_threshold = 1.0,
+                    .partial_fill_ratio = 0.5,
+                },
+                .auto_complete_partial_fills = false,
+                .order_repository = &order_repository,
+                .fill_repository = nullptr,
+                .position_repository = &position_repository,
+                .balance_repository = &balance_repository,
+                .market_state_cache = &market_cache,
+            });
+
+        log_test_step("run first runtime until local order is persisted as resting open state");
+        first_runtime.on_event(trading::core::MarketEvent {
+            .event_id = "trade-1",
+            .type = trading::core::MarketEventType::trade,
+            .instrument = make_btc_instrument(),
+            .price = 41990.0,
+            .quantity = 0.5,
+            .process_timestamp = 4900,
+        });
+    }
+
+    trading::app::RecoveryService recovery_service(
+        transaction_repository,
+        order_repository,
+        position_repository,
+        balance_repository,
+        market_cache,
+        transaction_cache);
+
+    log_test_step("recover persisted open-order snapshot after restart");
+    const auto snapshot = recovery_service.recover();
+    expect_equal(snapshot.open_orders.size(), std::size_t {1}, "one local open order should be recoverable after restart");
+
+    trading::core::FixedClock second_clock(6000);
+    trading::storage::InMemoryFillRepository fill_repository;
+    trading::app::SimulationRuntime recovered_runtime(
+        second_clock,
+        {
+            .max_order_quantity = 1.0,
+            .max_order_notional = 50000.0,
+            .max_position_quantity = 2.0,
+            .stale_after_ms = 1000,
+            .kill_switch_enabled = false,
+        },
+        {
+                .strategy = {
+                    .strategy_id = "threshold-1",
+                    .instrument_id = "binance:BTCUSDT",
+                    .instrument = make_btc_instrument(),
+                    .trigger_price = 41000.0,
+                    .order_quantity = 0.4,
+                    .side = trading::core::OrderSide::buy,
+            },
+            .execution = {
+                .partial_fill_threshold = 1.0,
+                .partial_fill_ratio = 0.5,
+            },
+            .auto_complete_partial_fills = false,
+            .order_repository = &order_repository,
+            .fill_repository = &fill_repository,
+            .position_repository = &position_repository,
+            .balance_repository = &balance_repository,
+            .market_state_cache = &market_cache,
+        });
+
+    log_test_step("restore recovered snapshot into new runtime");
+    recovery_service.restore_runtime(snapshot, recovered_runtime);
+
+    log_test_step("continue matching after restart with external executable ask liquidity");
+    recovered_runtime.on_event(trading::core::MarketEvent {
+        .event_id = "book-1",
+        .type = trading::core::MarketEventType::book_snapshot,
+        .instrument = make_btc_instrument(),
+        .ask_levels = {
+            {.price = 41990.0, .quantity = 0.4},
+        },
+        .process_timestamp = 5900,
+    });
+
+    log_test_step("verify recovered local open order continues to filled state after restart");
+    const auto filled_orders = order_repository.all_open_orders();
+    expect_equal(filled_orders.size(), std::size_t {0}, "filled recovered order should no longer appear as open");
+    expect_equal(fill_repository.all_fills().size(), std::size_t {1}, "continued matching after restart should persist fill");
+    const auto position = recovered_runtime.portfolio().get_position("binance:BTCUSDT");
+    expect_true(position.has_value(), "recovered runtime should apply continued fill into portfolio");
+    expect_near(position->net_quantity, 0.4, 1e-9, "continued post-restart fill should restore intended position");
+}
+
 // Verifies replay reproduces the same state as direct fixed-session processing.
 void test_replay_service_reproduces_fixed_session_state() {
     const auto temp_dir = make_temp_directory("replay-fixed-session");
@@ -3686,6 +3939,7 @@ int main() {
         {"live_market_data_feed_controller_stops_after_retry_budget", test_live_market_data_feed_controller_stops_after_retry_budget},
         {"sample_threshold_strategy_emits_order_on_trigger", test_sample_threshold_strategy_emits_order_on_trigger},
         {"sample_threshold_strategy_no_order_without_trigger", test_sample_threshold_strategy_no_order_without_trigger},
+        {"sample_threshold_strategy_propagates_full_instrument_metadata", test_sample_threshold_strategy_propagates_full_instrument_metadata},
         {"sample_threshold_strategy_reset_command", test_sample_threshold_strategy_reset_command},
         {"strategy_coordinator_isolates_failing_strategy", test_strategy_coordinator_isolates_failing_strategy},
         {"risk_engine_approves_valid_order", test_risk_engine_approves_valid_order},
@@ -3738,6 +3992,8 @@ int main() {
         {"recovery_service_restores_runtime_and_cache", test_recovery_service_restores_runtime_and_cache},
         {"recovery_service_prefers_explicit_checkpoints", test_recovery_service_prefers_explicit_checkpoints},
         {"recovery_service_resumes_kafka_from_next_offset", test_recovery_service_resumes_kafka_from_next_offset},
+        {"simulation_runtime_persists_local_state_for_recovery", test_simulation_runtime_persists_local_state_for_recovery},
+        {"recovery_service_restores_local_open_order_continuity", test_recovery_service_restores_local_open_order_continuity},
         {"replay_service_reproduces_fixed_session_state", test_replay_service_reproduces_fixed_session_state},
         {"replay_service_skips_invalid_records", test_replay_service_skips_invalid_records},
         {"replay_service_isolated_from_live_clock", test_replay_service_isolated_from_live_clock},

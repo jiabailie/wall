@@ -18,6 +18,11 @@ SimulationRuntime::SimulationRuntime(const trading::core::IClock& clock,
           .clock = clock,
       }),
       risk_engine_(risk_config, market_state_store_, clock),
+      order_repository_(runtime_config.order_repository),
+      fill_repository_(runtime_config.fill_repository),
+      position_repository_(runtime_config.position_repository),
+      balance_repository_(runtime_config.balance_repository),
+      market_state_cache_(runtime_config.market_state_cache),
       controls_(controls),
       metrics_(metrics),
       auto_complete_partial_fills_(runtime_config.auto_complete_partial_fills) {
@@ -35,6 +40,7 @@ void SimulationRuntime::on_event(const trading::core::EngineEvent& event) {
     const auto event_started_ms = clock_.now_ms();
     if (const auto* market_event = std::get_if<trading::core::MarketEvent>(&event)) {
         market_state_store_.apply(*market_event);
+        persist_market_snapshot(*market_event);
         handle_execution_result(execution_engine_.process_market_event(*market_event));
         if (market_event->price > 0.0) {
             portfolio_service_.set_mark_price(market_event->instrument.instrument_id, market_event->price);
@@ -67,6 +73,7 @@ void SimulationRuntime::on_event(const trading::core::EngineEvent& event) {
             metrics_->increment("orders_approved");
         }
         const auto result = execution_engine_.submit(request);
+        persist_new_order(request, result);
         handle_execution_result(result);
 
         if (metrics_ != nullptr) {
@@ -87,13 +94,63 @@ void SimulationRuntime::on_event(const trading::core::EngineEvent& event) {
 
 // Applies execution fills into the portfolio and counters.
 void SimulationRuntime::handle_execution_result(const trading::execution::ExecutionResult& result) {
+    if (order_repository_ != nullptr) {
+        for (const auto& update : result.updates) {
+            order_repository_->save_order_update(update);
+        }
+    }
+
     for (const auto& fill : result.fills) {
+        if (fill_repository_ != nullptr) {
+            fill_repository_->append_fill(fill);
+        }
         portfolio_service_.apply_fill(fill);
         ++applied_fill_count_;
         if (metrics_ != nullptr) {
             metrics_->increment("fills_applied");
         }
     }
+
+    if (position_repository_ != nullptr) {
+        for (const auto& position : portfolio_service_.all_positions()) {
+            position_repository_->save_position(position);
+        }
+    }
+    if (balance_repository_ != nullptr) {
+        for (const auto& balance : portfolio_service_.all_balances()) {
+            balance_repository_->save_balance(balance);
+        }
+    }
+}
+
+void SimulationRuntime::persist_new_order(const trading::core::OrderRequest& request,
+                                          const trading::execution::ExecutionResult& result) {
+    if (order_repository_ == nullptr || result.order_id.empty()) {
+        return;
+    }
+
+    if (!order_repository_->get_order(result.order_id).has_value()) {
+        order_repository_->save_order(request, result.order_id, result.client_order_id);
+    }
+}
+
+void SimulationRuntime::persist_market_snapshot(const trading::core::MarketEvent& event) {
+    if (market_state_cache_ == nullptr) {
+        return;
+    }
+
+    market_state_cache_->upsert_snapshot({
+        .instrument_id = event.instrument.instrument_id,
+        .best_bid = !event.bid_levels.empty()
+            ? std::optional<double>(event.bid_levels.front().price)
+            : event.bid_price,
+        .best_ask = !event.ask_levels.empty()
+            ? std::optional<double>(event.ask_levels.front().price)
+            : event.ask_price,
+        .last_trade_price = event.price > 0.0 ? std::optional<double>(event.price) : std::nullopt,
+        .last_trade_quantity = event.quantity > 0.0 ? std::optional<double>(event.quantity) : std::nullopt,
+        .last_process_timestamp = event.process_timestamp,
+    });
 }
 
 void SimulationRuntime::restore_open_order(const trading::storage::OrderRecord& order) {
