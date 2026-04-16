@@ -52,6 +52,28 @@ namespace {
 
 using TestFunction = std::function<void()>;
 
+thread_local std::string g_current_test_name;
+thread_local std::string g_current_test_step;
+
+// Records and prints one human-readable test step for detailed debug output.
+void log_test_step(const std::string& message) {
+    g_current_test_step = message;
+    std::cout << "  [STEP] " << message << '\n';
+}
+
+// Builds a failure message with current test and step context.
+std::string contextualize_failure(const std::string& message) {
+    std::stringstream stream;
+    if (!g_current_test_name.empty()) {
+        stream << "[" << g_current_test_name << "] ";
+    }
+    if (!g_current_test_step.empty()) {
+        stream << g_current_test_step << ": ";
+    }
+    stream << message;
+    return stream.str();
+}
+
 // Creates a unique temporary directory path for storage adapter tests.
 std::filesystem::path make_temp_directory(const std::string& prefix) {
     static std::size_t counter = 0;
@@ -201,7 +223,7 @@ trading::core::TransactionCommand make_transaction(const std::string& transactio
 // Fails the current test when the condition is false.
 void expect_true(const bool condition, const std::string& message) {
     if (!condition) {
-        throw std::runtime_error(message);
+        throw std::runtime_error(contextualize_failure(message));
     }
 }
 
@@ -209,14 +231,14 @@ void expect_true(const bool condition, const std::string& message) {
 template <typename T>
 void expect_equal(const T& actual, const T& expected, const std::string& message) {
     if (!(actual == expected)) {
-        throw std::runtime_error(message);
+        throw std::runtime_error(contextualize_failure(message));
     }
 }
 
 // Fails the current test when the two floating-point values differ beyond tolerance.
 void expect_near(const double actual, const double expected, const double tolerance, const std::string& message) {
     if (std::abs(actual - expected) > tolerance) {
-        throw std::runtime_error(message);
+        throw std::runtime_error(contextualize_failure(message));
     }
 }
 
@@ -1228,6 +1250,7 @@ void test_order_book_cancel_prunes_empty_level() {
 void test_matching_engine_fully_matches_crossing_order() {
     trading::execution::MatchingEngine engine;
 
+    log_test_step("submit resting sell order");
     const auto resting_result = engine.submit({
         .request_id = "req-1",
         .strategy_id = "strategy-1",
@@ -1237,6 +1260,7 @@ void test_matching_engine_fully_matches_crossing_order() {
         .quantity = 0.4,
         .price = 42000.0,
     });
+    log_test_step("submit crossing buy order");
     const auto taker_result = engine.submit({
         .request_id = "req-2",
         .strategy_id = "strategy-1",
@@ -1249,6 +1273,7 @@ void test_matching_engine_fully_matches_crossing_order() {
 
     const auto* book = engine.find_book(make_btc_instrument().instrument_id);
 
+    log_test_step("verify full match and empty book");
     expect_equal(resting_result.updates.size(), std::size_t {1}, "non-crossing first order should only acknowledge");
     expect_equal(taker_result.updates.size(), std::size_t {2}, "crossing order should ack then fill");
     expect_equal(taker_result.updates[1].status, trading::core::OrderStatus::filled, "crossing order should fill");
@@ -1263,6 +1288,7 @@ void test_matching_engine_fully_matches_crossing_order() {
 void test_matching_engine_partially_matches_and_rests_residual() {
     trading::execution::MatchingEngine engine;
 
+    log_test_step("submit resting sell liquidity");
     const auto ignored_resting_result = engine.submit({
         .request_id = "req-1",
         .strategy_id = "strategy-1",
@@ -1273,6 +1299,7 @@ void test_matching_engine_partially_matches_and_rests_residual() {
         .price = 42000.0,
     });
     static_cast<void>(ignored_resting_result);
+    log_test_step("submit larger crossing buy order");
     const auto taker_result = engine.submit({
         .request_id = "req-2",
         .strategy_id = "strategy-1",
@@ -1290,6 +1317,7 @@ void test_matching_engine_partially_matches_and_rests_residual() {
     const auto best_bid = book->best_bid();
     const auto best_ask = book->best_ask();
 
+    log_test_step("verify partial fill and residual resting quantity");
     expect_equal(taker_result.updates.size(), std::size_t {2}, "partially matched order should ack then partially fill");
     expect_equal(taker_result.updates[1].status, trading::core::OrderStatus::partially_filled, "terminal update should be partial");
     expect_equal(taker_result.updates[1].filled_quantity, 0.4, "filled quantity should match executed amount");
@@ -1395,6 +1423,112 @@ void test_matching_engine_leaves_non_crossing_order_resting() {
     expect_equal(result.fills.size(), std::size_t {0}, "non-crossing order should not fill");
     expect_true(book->find_order(result.order_id).has_value(), "non-crossing order should rest on the book");
     expect_equal(book->order_count(), std::size_t {2}, "both sides should remain resting");
+}
+
+// Verifies cancel removes a fully resting order and returns the expected lifecycle updates.
+void test_matching_engine_cancels_resting_order() {
+    trading::execution::MatchingEngine engine;
+
+    const auto resting_result = engine.submit({
+        .request_id = "req-1",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::sell,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.4,
+        .price = 42100.0,
+    });
+    const auto cancel_result = engine.cancel(resting_result.order_id, resting_result.client_order_id);
+
+    const auto* book = engine.find_book(make_btc_instrument().instrument_id);
+    const auto order = engine.get_order(resting_result.order_id);
+
+    expect_equal(cancel_result.updates.size(), std::size_t {2}, "cancel should produce pending-cancel and canceled updates");
+    expect_equal(cancel_result.updates[0].status, trading::core::OrderStatus::pending_cancel, "first cancel update should be pending_cancel");
+    expect_equal(cancel_result.updates[1].status, trading::core::OrderStatus::canceled, "second cancel update should be canceled");
+    expect_true(book != nullptr, "book should still exist");
+    expect_equal(book->order_count(), std::size_t {0}, "canceled resting order should be removed from the book");
+    expect_true(order.has_value(), "canceled order should remain queryable");
+    expect_equal(order->status, trading::core::OrderStatus::canceled, "tracked order state should become canceled");
+    expect_equal(order->filled_quantity, 0.0, "canceled resting order should preserve zero filled quantity");
+}
+
+// Verifies a partially filled resting order can be canceled without losing cumulative fill state.
+void test_matching_engine_cancels_partially_filled_resting_order() {
+    trading::execution::MatchingEngine engine;
+
+    log_test_step("submit maker sell order");
+    const auto maker_result = engine.submit({
+        .request_id = "req-1",
+        .strategy_id = "maker-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::sell,
+        .type = trading::core::OrderType::limit,
+        .quantity = 1.0,
+        .price = 42000.0,
+    });
+    log_test_step("submit taker buy order for partial maker fill");
+    const auto taker_result = engine.submit({
+        .request_id = "req-2",
+        .strategy_id = "taker-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.4,
+        .price = 42000.0,
+    });
+    log_test_step("cancel remaining maker quantity");
+    const auto cancel_result = engine.cancel(maker_result.order_id, maker_result.client_order_id);
+
+    const auto* book = engine.find_book(make_btc_instrument().instrument_id);
+    const auto maker_order = engine.get_order(maker_result.order_id);
+    const auto taker_order = engine.get_order(taker_result.order_id);
+
+    log_test_step("verify cancel preserves cumulative maker fill state");
+    expect_equal(cancel_result.updates.size(), std::size_t {2}, "cancel after partial fill should still produce two cancel updates");
+    expect_equal(cancel_result.updates[0].filled_quantity, 0.4, "pending cancel should preserve cumulative filled quantity");
+    expect_equal(cancel_result.updates[1].filled_quantity, 0.4, "canceled update should preserve cumulative filled quantity");
+    expect_true(book != nullptr, "book should still exist");
+    expect_equal(book->order_count(), std::size_t {0}, "residual resting quantity should be removed after cancel");
+    expect_true(maker_order.has_value(), "maker order should remain tracked");
+    expect_equal(maker_order->status, trading::core::OrderStatus::canceled, "partially filled maker should become canceled");
+    expect_equal(maker_order->filled_quantity, 0.4, "maker order should retain its cumulative filled quantity");
+    expect_true(taker_order.has_value(), "taker order should remain tracked");
+    expect_equal(taker_order->status, trading::core::OrderStatus::filled, "taker order should remain terminal filled");
+}
+
+// Verifies internal tracked order state reflects matching outcomes for both maker and taker orders.
+void test_matching_engine_tracks_order_lifecycle_state() {
+    trading::execution::MatchingEngine engine;
+
+    const auto maker_result = engine.submit({
+        .request_id = "req-1",
+        .strategy_id = "maker-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::sell,
+        .type = trading::core::OrderType::limit,
+        .quantity = 1.0,
+        .price = 42000.0,
+    });
+    const auto taker_result = engine.submit({
+        .request_id = "req-2",
+        .strategy_id = "taker-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.4,
+        .price = 42010.0,
+    });
+
+    const auto maker_order = engine.get_order(maker_result.order_id);
+    const auto taker_order = engine.get_order(taker_result.order_id);
+
+    expect_true(maker_order.has_value(), "maker order should be queryable");
+    expect_true(taker_order.has_value(), "taker order should be queryable");
+    expect_equal(maker_order->status, trading::core::OrderStatus::partially_filled, "maker order should become partially filled after being hit");
+    expect_equal(maker_order->filled_quantity, 0.4, "maker cumulative filled quantity should track matched volume");
+    expect_equal(taker_order->status, trading::core::OrderStatus::filled, "crossing taker order should become filled");
+    expect_equal(taker_order->filled_quantity, 0.4, "taker cumulative filled quantity should match executed volume");
 }
 
 // Verifies unsupported market orders are rejected by the simulator.
@@ -1805,6 +1939,7 @@ void test_simulation_runtime_happy_path() {
             .auto_complete_partial_fills = false,
         });
 
+    log_test_step("seed restored resting sell order for matching");
     runtime.restore_open_order({
         .order_id = "resting-sell-1",
         .client_order_id = "resting-client-1",
@@ -1818,6 +1953,7 @@ void test_simulation_runtime_happy_path() {
         .filled_quantity = 0.0,
     });
 
+    log_test_step("process trigger trade event through runtime");
     runtime.on_event(trading::core::MarketEvent {
         .event_id = "event-1",
         .type = trading::core::MarketEventType::trade,
@@ -1827,6 +1963,7 @@ void test_simulation_runtime_happy_path() {
         .process_timestamp = 4900,
     });
 
+    log_test_step("verify approved request and applied fill");
     expect_equal(runtime.risk_approved_count(), std::size_t {1}, "happy path should approve one request");
     expect_equal(runtime.risk_rejected_count(), std::size_t {0}, "happy path should not reject");
     expect_equal(runtime.applied_fill_count(), std::size_t {1}, "happy path should apply one fill");
@@ -1905,6 +2042,7 @@ void test_simulation_runtime_applies_partial_match_fill() {
             .auto_complete_partial_fills = true,
         });
 
+    log_test_step("seed limited opposing sell liquidity");
     runtime.restore_open_order({
         .order_id = "resting-sell-1",
         .client_order_id = "resting-client-1",
@@ -1918,6 +2056,7 @@ void test_simulation_runtime_applies_partial_match_fill() {
         .filled_quantity = 0.0,
     });
 
+    log_test_step("process strategy-triggering market event");
     runtime.on_event(trading::core::MarketEvent {
         .event_id = "event-1",
         .type = trading::core::MarketEventType::trade,
@@ -1927,6 +2066,7 @@ void test_simulation_runtime_applies_partial_match_fill() {
         .process_timestamp = 4900,
     });
 
+    log_test_step("verify only available liquidity is filled");
     expect_equal(runtime.risk_approved_count(), std::size_t {1}, "partial-match path should approve one request");
     expect_equal(runtime.applied_fill_count(), std::size_t {1}, "partial-match path should apply one fill");
     const auto position = runtime.portfolio().get_position("binance:BTCUSDT");
@@ -2047,6 +2187,7 @@ void test_in_memory_order_repository_save_and_update() {
     trading::storage::InMemoryOrderRepository repository;
     const auto instrument = make_btc_instrument();
 
+    log_test_step("save initial order and apply lifecycle update");
     repository.save_order(
         {
             .request_id = "req-1",
@@ -2067,6 +2208,7 @@ void test_in_memory_order_repository_save_and_update() {
         .reason = std::nullopt,
     });
 
+    log_test_step("reload saved order and verify updated state");
     const auto order = repository.get_order("order-1");
     expect_true(order.has_value(), "order should exist after save");
     expect_equal(order->strategy_id, std::string("strategy-1"), "strategy id should persist");
@@ -2104,6 +2246,7 @@ void test_in_memory_position_repository_update() {
 // Verifies market snapshot cache write and read behavior.
 void test_in_memory_market_state_cache_write_read() {
     trading::storage::InMemoryMarketStateCache cache;
+    log_test_step("write market snapshot into in-memory cache");
     cache.upsert_snapshot({
         .instrument_id = "binance:BTCUSDT",
         .best_bid = 42000.0,
@@ -2113,6 +2256,7 @@ void test_in_memory_market_state_cache_write_read() {
         .last_process_timestamp = 5000,
     });
 
+    log_test_step("read market snapshot back from cache");
     const auto snapshot = cache.get_snapshot("binance:BTCUSDT");
     expect_true(snapshot.has_value(), "snapshot should exist");
     expect_true(snapshot->best_bid.has_value(), "best bid should be present");
@@ -2126,6 +2270,7 @@ void test_postgres_order_repository_write_read() {
     {
         trading::infrastructure::PostgresOrderRepository repository(temp_dir);
         const auto instrument = make_btc_instrument();
+        log_test_step("persist order and lifecycle update through Postgres-style repository");
         repository.save_order(
             {
                 .request_id = "req-1",
@@ -2148,6 +2293,7 @@ void test_postgres_order_repository_write_read() {
     }
     {
         trading::infrastructure::PostgresOrderRepository repository(temp_dir);
+        log_test_step("reload persisted order record from repository");
         const auto order = repository.get_order("order-1");
         expect_true(order.has_value(), "postgres order adapter should persist records");
         expect_equal(order->status, trading::core::OrderStatus::acknowledged, "persisted order status should reload");
@@ -2158,10 +2304,12 @@ void test_postgres_order_repository_write_read() {
 // Verifies Redis-style cache adapters read/write transaction and market state values.
 void test_redis_cache_adapters_write_read() {
     trading::infrastructure::RedisTransactionCache transaction_cache;
+    log_test_step("write transaction status to Redis-style transaction cache");
     transaction_cache.set_status("tx-1", "processed");
     expect_equal(transaction_cache.get_status("tx-1"), std::string("processed"), "redis transaction cache should store statuses");
 
     trading::infrastructure::RedisMarketStateCache market_cache;
+    log_test_step("write and read market snapshot through Redis-style market cache");
     market_cache.upsert_snapshot({
         .instrument_id = "binance:BTCUSDT",
         .best_bid = 42000.0,
@@ -2181,11 +2329,13 @@ void test_postgres_transaction_checkpoint_persistence() {
     {
         trading::infrastructure::PostgresTransactionRepository repository(temp_dir);
         const auto command = make_transaction("tx-1", 77);
+        log_test_step("persist received and processed transaction checkpoint");
         repository.save_received(command);
         repository.save_processed("tx-1", "processed");
     }
     {
         trading::infrastructure::PostgresTransactionRepository repository(temp_dir);
+        log_test_step("reload transaction checkpoint from repository");
         const auto record = repository.get_record("tx-1");
         expect_true(record.has_value(), "transaction checkpoint should persist");
         expect_equal(record->status, std::string("processed"), "persisted checkpoint status should reload");
@@ -2199,6 +2349,7 @@ void test_postgres_explicit_kafka_checkpoint_persistence() {
     const auto temp_dir = make_temp_directory("postgres-explicit-checkpoint-repo");
     {
         trading::infrastructure::PostgresTransactionRepository repository(temp_dir);
+        log_test_step("persist explicit Kafka checkpoint");
         repository.save_checkpoint({
             .topic = "trading-transactions",
             .partition = 2,
@@ -2207,6 +2358,7 @@ void test_postgres_explicit_kafka_checkpoint_persistence() {
     }
     {
         trading::infrastructure::PostgresTransactionRepository repository(temp_dir);
+        log_test_step("reload explicit Kafka checkpoint");
         const auto checkpoints = repository.all_checkpoints();
         expect_equal(checkpoints.size(), std::size_t {1}, "explicit checkpoint should persist");
         expect_equal(checkpoints[0].partition, 2, "persisted checkpoint partition should reload");
@@ -2220,6 +2372,7 @@ void test_postgres_balance_repository_write_read() {
     const auto temp_dir = make_temp_directory("postgres-balance-repo");
     {
         trading::infrastructure::PostgresBalanceRepository repository(temp_dir);
+        log_test_step("persist balance snapshot");
         repository.save_balance({
             .asset = "USDT",
             .total_balance = 10500.5,
@@ -2228,6 +2381,7 @@ void test_postgres_balance_repository_write_read() {
     }
     {
         trading::infrastructure::PostgresBalanceRepository repository(temp_dir);
+        log_test_step("reload balance snapshot");
         const auto balance = repository.get_balance("USDT");
         expect_true(balance.has_value(), "balance snapshot should persist");
         expect_equal(balance->total_balance, 10500.5, "persisted balance total should reload");
@@ -2241,6 +2395,7 @@ void test_postgres_order_intent_repository_write_read() {
     const auto temp_dir = make_temp_directory("postgres-order-intent-repo");
     {
         trading::infrastructure::PostgresOrderIntentRepository repository(temp_dir);
+        log_test_step("persist outbound order intent");
         repository.append_intent({
             .request_id = "req-1",
             .strategy_id = "strategy-1",
@@ -2253,6 +2408,7 @@ void test_postgres_order_intent_repository_write_read() {
     }
     {
         trading::infrastructure::PostgresOrderIntentRepository repository(temp_dir);
+        log_test_step("reload persisted order intent");
         const auto intents = repository.all_intents();
         expect_equal(intents.size(), std::size_t {1}, "order intent should persist");
         expect_equal(intents[0].request_id, std::string("req-1"), "persisted order intent id should reload");
@@ -2267,6 +2423,7 @@ void test_postgres_execution_report_repository_write_read() {
     const auto temp_dir = make_temp_directory("postgres-execution-report-repo");
     {
         trading::infrastructure::PostgresExecutionReportRepository repository(temp_dir);
+        log_test_step("persist execution report");
         repository.append_report({
             .report_id = "report-1",
             .order_id = "order-1",
@@ -2283,6 +2440,7 @@ void test_postgres_execution_report_repository_write_read() {
     }
     {
         trading::infrastructure::PostgresExecutionReportRepository repository(temp_dir);
+        log_test_step("reload persisted execution report");
         const auto reports = repository.all_reports();
         expect_equal(reports.size(), std::size_t {1}, "execution report should persist");
         expect_equal(reports[0].report_id, std::string("report-1"), "persisted execution report id should reload");
@@ -2304,6 +2462,7 @@ void test_recovery_service_restores_runtime_and_cache() {
 
     auto tx_1 = make_transaction("tx-1", 10);
     auto tx_2 = make_transaction("tx-2", 12);
+    log_test_step("seed repositories with processed transactions and open order state");
     transaction_repository.save_received(tx_1);
     transaction_repository.save_processed("tx-1", "processed");
     transaction_repository.save_received(tx_2);
@@ -2351,6 +2510,7 @@ void test_recovery_service_restores_runtime_and_cache() {
         market_cache,
         transaction_cache);
 
+    log_test_step("run recovery and derive runtime snapshot");
     const auto snapshot = recovery_service.recover({
         {
             .instrument_id = "binance:BTCUSDT",
@@ -2393,8 +2553,10 @@ void test_recovery_service_restores_runtime_and_cache() {
             },
             .auto_complete_partial_fills = false,
         });
+    log_test_step("restore recovered snapshot into simulation runtime");
     recovery_service.restore_runtime(snapshot, runtime);
 
+    log_test_step("verify restored portfolio and warmed market cache");
     const auto position = runtime.portfolio().get_position("binance:BTCUSDT");
     const auto balance = runtime.portfolio().get_balance("USDT");
     expect_true(position.has_value(), "recovered runtime should restore position");
@@ -2417,6 +2579,7 @@ void test_recovery_service_prefers_explicit_checkpoints() {
 
     auto tx = make_transaction("tx-1", 77);
     tx.kafka_partition = 2;
+    log_test_step("seed processed transaction and explicit Kafka checkpoint");
     transaction_repository.save_received(tx);
     transaction_repository.save_processed("tx-1", "processed");
     transaction_repository.save_checkpoint({
@@ -2432,6 +2595,7 @@ void test_recovery_service_prefers_explicit_checkpoints() {
         balance_repository,
         market_cache,
         transaction_cache);
+    log_test_step("recover snapshot and verify explicit checkpoint precedence");
     const auto snapshot = recovery_service.recover();
 
     expect_equal(snapshot.kafka_checkpoints.size(), std::size_t {1}, "one explicit checkpoint should be recovered");
@@ -2449,6 +2613,7 @@ void test_recovery_service_resumes_kafka_from_next_offset() {
 
     auto tx = make_transaction("tx-1", 77);
     tx.kafka_partition = 2;
+    log_test_step("seed processed transaction for Kafka resume");
     transaction_repository.save_received(tx);
     transaction_repository.save_processed("tx-1", "processed");
 
@@ -2459,11 +2624,13 @@ void test_recovery_service_resumes_kafka_from_next_offset() {
         balance_repository,
         market_cache,
         transaction_cache);
+    log_test_step("recover snapshot and resume Kafka consumer");
     const auto snapshot = recovery_service.recover();
 
     FakeKafkaConsumerClient kafka_client({});
     recovery_service.resume_kafka(snapshot, kafka_client);
 
+    log_test_step("verify recovered Kafka seek offset");
     expect_equal(kafka_client.seeks().size(), std::size_t {1}, "one kafka partition should be resumed");
     expect_equal(kafka_client.seeks()[0].partition, 2, "recovery should resume the recovered partition");
     expect_equal(kafka_client.seeks()[0].offset, std::int64_t {78}, "recovery should seek to the next offset");
@@ -2490,6 +2657,7 @@ void test_replay_service_reproduces_fixed_session_state() {
     };
 
     trading::storage::ReplayService replay_service(log_path);
+    log_test_step("write fixed event log");
     replay_service.reset_log();
     for (const auto& event : events) {
         replay_service.append_event(event);
@@ -2519,6 +2687,7 @@ void test_replay_service_reproduces_fixed_session_state() {
             },
             .auto_complete_partial_fills = false,
         });
+    log_test_step("seed direct runtime with resting liquidity");
     direct_runtime.restore_open_order({
         .order_id = "resting-sell-1",
         .client_order_id = "resting-client-1",
@@ -2559,6 +2728,7 @@ void test_replay_service_reproduces_fixed_session_state() {
             },
             .auto_complete_partial_fills = false,
         });
+    log_test_step("seed replay runtime with matching resting liquidity");
     replay_runtime.restore_open_order({
         .order_id = "resting-sell-1",
         .client_order_id = "resting-client-1",
@@ -2572,10 +2742,12 @@ void test_replay_service_reproduces_fixed_session_state() {
         .filled_quantity = 0.0,
     });
 
+    log_test_step("replay persisted events into runtime");
     const auto stats = replay_service.replay([&replay_runtime](const trading::core::EngineEvent& event) {
         replay_runtime.on_event(event);
     });
 
+    log_test_step("compare replay results to direct processing");
     expect_equal(stats.replayed_records, std::size_t {2}, "replay should apply both records");
     expect_equal(replay_runtime.risk_approved_count(), direct_runtime.risk_approved_count(), "replay should match approved count");
     expect_equal(replay_runtime.applied_fill_count(), direct_runtime.applied_fill_count(), "replay should match fill count");
@@ -2708,6 +2880,7 @@ void test_backtest_runner_summarizes_runtime_results() {
     const auto temp_dir = make_temp_directory("backtest-summary");
     const auto log_path = temp_dir / "events.tsv";
     trading::storage::ReplayService replay_service(log_path);
+    log_test_step("write historical backtest event log");
     replay_service.reset_log();
 
     replay_service.append_event(trading::core::MarketEvent {
@@ -2755,6 +2928,7 @@ void test_backtest_runner_summarizes_runtime_results() {
             },
             .auto_complete_partial_fills = false,
         });
+    log_test_step("seed runtime with resting liquidity for backtest matching");
     runtime.restore_open_order({
         .order_id = "resting-sell-1",
         .client_order_id = "resting-client-1",
@@ -2769,8 +2943,10 @@ void test_backtest_runner_summarizes_runtime_results() {
     });
 
     trading::app::BacktestRunner runner(log_path);
+    log_test_step("run backtest and collect summary");
     const auto summary = runner.run(runtime);
 
+    log_test_step("verify replay, strategy, and fill summary fields");
     expect_equal(summary.replay_stats.replayed_records, std::size_t {1}, "backtest should replay the market event");
     expect_equal(summary.configured_strategies, std::size_t {1}, "configured strategy count should be reported");
     expect_equal(summary.active_strategies, std::size_t {1}, "healthy strategy should remain active");
@@ -2803,6 +2979,7 @@ void test_kafka_transaction_consumer_parses_payload() {
     });
     trading::infrastructure::KafkaTransactionConsumer consumer(fake_client, "trading-transactions");
 
+    log_test_step("poll and parse valid Kafka payload");
     const auto command = consumer.poll();
     expect_true(command.has_value(), "adapter should parse valid kafka payload");
     expect_equal(command->transaction_id, std::string("tx-1"), "transaction id should match payload");
@@ -2835,6 +3012,7 @@ void test_kafka_transaction_consumer_skips_malformed_messages() {
     });
     trading::infrastructure::KafkaTransactionConsumer consumer(fake_client, "trading-transactions");
 
+    log_test_step("poll malformed then valid Kafka payloads");
     const auto command = consumer.poll();
     expect_true(command.has_value(), "consumer should continue to next message after malformed payload");
     expect_equal(command->transaction_id, std::string("tx-good"), "consumer should return the first valid payload");
@@ -2872,6 +3050,7 @@ void test_kafka_transaction_consumer_skips_malformed_payload_burst() {
     });
     trading::infrastructure::KafkaTransactionConsumer consumer(fake_client, "trading-transactions");
 
+    log_test_step("drain malformed burst until the next valid Kafka payload");
     const auto command = consumer.poll();
     expect_true(command.has_value(), "consumer should recover after malformed burst");
     expect_equal(command->transaction_id, std::string("tx-good-burst"), "first valid message after malformed burst should be returned");
@@ -2898,10 +3077,12 @@ void test_kafka_transaction_consumer_commit_checkpoint_behavior() {
     });
     trading::infrastructure::KafkaTransactionConsumer consumer(fake_client, "trading-transactions");
 
+    log_test_step("poll valid payload without auto-commit");
     const auto command = consumer.poll();
     expect_true(command.has_value(), "valid payload should be returned");
     expect_equal(fake_client.commits().size(), std::size_t {0}, "poll should not commit valid payload");
 
+    log_test_step("commit payload explicitly through consumer");
     consumer.commit(*command);
     expect_equal(fake_client.commits().size(), std::size_t {1}, "explicit commit should forward offset to client");
     expect_equal(fake_client.commits()[0].offset, std::int64_t {77}, "committed offset should match payload");
@@ -2911,6 +3092,7 @@ void test_kafka_transaction_consumer_commit_checkpoint_behavior() {
 void test_kafka_transaction_producer_serializes_payload() {
     const auto command = make_transaction("tx-serializer", 0);
 
+    log_test_step("serialize transaction command into Kafka payload format");
     const auto payload = trading::infrastructure::serialize_transaction_command_payload(command);
     expect_true(payload.find("transaction_id=tx-serializer") != std::string::npos, "payload should contain transaction id");
     expect_true(payload.find("user_id=user-1") != std::string::npos, "payload should contain user id");
@@ -2922,6 +3104,7 @@ void test_kafka_transaction_producer_serializes_payload() {
 // Verifies producer key serialization uses transaction_id|yyyyMMddHHmmSS.
 void test_kafka_transaction_producer_serializes_key() {
     const auto command = make_transaction("tx-serializer", 0);
+    log_test_step("serialize transaction key with UTC timestamp suffix");
     const auto key = trading::infrastructure::serialize_transaction_command_key(command, std::int64_t {1713254950000});
 
     expect_equal(key, std::string("tx-serializer|20240416080910"), "key should concatenate transaction id, separator, and UTC timestamp");
@@ -2929,6 +3112,7 @@ void test_kafka_transaction_producer_serializes_key() {
 
 // Verifies the transaction publisher can parse one flat JSON input line.
 void test_transaction_publisher_parses_json_line() {
+    log_test_step("parse valid flat JSON transaction line");
     const auto command = trading::app::parse_json_transaction_command_line(
         R"({"transaction_id":"tx-2001","user_id":"user-9","account_id":"account-9","command_type":"place_order","instrument_symbol":"ETHUSDT","quantity":1.25,"price":3200.5})");
 
@@ -2943,6 +3127,7 @@ void test_transaction_publisher_parses_json_line() {
 
 // Verifies malformed JSON transaction lines are rejected safely.
 void test_transaction_publisher_rejects_invalid_json_line() {
+    log_test_step("reject malformed JSON transaction line");
     const auto command = trading::app::parse_json_transaction_command_line(
         R"({"transaction_id":"tx-2001","user_id":"user-9","quantity":"oops"})");
 
@@ -2967,12 +3152,12 @@ void test_transaction_ingestor_order_and_commit() {
     trading::storage::InMemoryTransactionCache cache;
     trading::ingestion::TransactionIngestor ingestor(consumer, repository, cache, dispatcher);
 
-    // Step 1: Process both mock transactions through the ingestor.
+    log_test_step("process both mock transactions through ingestor");
     expect_true(ingestor.process_next(), "first transaction should be processed");
     expect_true(ingestor.process_next(), "second transaction should be processed");
     expect_true(!ingestor.process_next(), "no third transaction should exist");
 
-    // Step 2: Verify ordered processing and ordered commits.
+    log_test_step("verify publish order, commits, cache, and repository status");
     expect_equal(processed_ids.size(), std::size_t {2}, "two transactions should be published");
     expect_equal(processed_ids[0], std::string("tx-1"), "first transaction order should match");
     expect_equal(processed_ids[1], std::string("tx-2"), "second transaction order should match");
@@ -3000,10 +3185,10 @@ void test_transaction_ingestor_rejects_invalid_messages() {
     trading::storage::InMemoryTransactionCache cache;
     trading::ingestion::TransactionIngestor ingestor(consumer, repository, cache, dispatcher);
 
-    // Step 1: Process the invalid message.
+    log_test_step("process invalid transaction message");
     expect_true(ingestor.process_next(), "invalid transaction should still be handled");
 
-    // Step 2: Verify it was rejected and never dispatched to runtime subscribers.
+    log_test_step("verify invalid message rejection and commit behavior");
     expect_true(processed_ids.empty(), "invalid transaction should not be published");
     expect_equal(cache.get_status("tx-bad"), std::string("rejected"), "invalid transaction should be rejected");
     expect_equal(repository.records()[0].status, std::string("rejected"), "repository should record rejection");
@@ -3250,6 +3435,9 @@ int main() {
         {"matching_engine_partially_matches_and_rests_residual", test_matching_engine_partially_matches_and_rests_residual},
         {"matching_engine_sweeps_multiple_levels_in_price_time_order", test_matching_engine_sweeps_multiple_levels_in_price_time_order},
         {"matching_engine_leaves_non_crossing_order_resting", test_matching_engine_leaves_non_crossing_order_resting},
+        {"matching_engine_cancels_resting_order", test_matching_engine_cancels_resting_order},
+        {"matching_engine_cancels_partially_filled_resting_order", test_matching_engine_cancels_partially_filled_resting_order},
+        {"matching_engine_tracks_order_lifecycle_state", test_matching_engine_tracks_order_lifecycle_state},
         {"simulated_execution_engine_rejects_market_order", test_simulated_execution_engine_rejects_market_order},
         {"simulated_execution_engine_partial_then_full_fill", test_simulated_execution_engine_partial_then_full_fill},
         {"simulated_execution_engine_cancel_open_order", test_simulated_execution_engine_cancel_open_order},
@@ -3306,6 +3494,9 @@ int main() {
     // Step 1: Execute each test and print a simple result line.
     for (const auto& [name, test] : tests) {
         try {
+            g_current_test_name = name;
+            g_current_test_step.clear();
+            std::cout << "[RUN ] " << name << '\n';
             test();
             std::cout << "[PASS] " << name << '\n';
         } catch (const std::exception& exception) {
