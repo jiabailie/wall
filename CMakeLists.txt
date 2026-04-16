@@ -94,5 +94,8 @@ target_link_libraries(wall_tx_producer PRIVATE trading_engine)
 add_executable(wall_backtest src/tools/backtest_main.cpp)
 target_link_libraries(wall_backtest PRIVATE trading_engine)
 
+add_executable(wall_benchmark src/tools/benchmark_main.cpp)
+target_link_libraries(wall_benchmark PRIVATE trading_engine)
+
 enable_testing()
 add_test(NAME wall_tests COMMAND wall_tests)
