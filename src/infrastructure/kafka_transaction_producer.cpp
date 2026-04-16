@@ -2,6 +2,9 @@
 
 #include <librdkafka/rdkafka.h>
 
+#include <chrono>
+#include <ctime>
+#include <iomanip>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -52,6 +55,16 @@ std::string serialize_transaction_command_payload(const trading::core::Transacti
     return payload.str();
 }
 
+std::string serialize_transaction_command_key(const trading::core::TransactionCommand& command,
+                                              const std::int64_t timestamp_ms) {
+    const auto timestamp_seconds = static_cast<std::time_t>(timestamp_ms / 1000);
+    const auto utc_time = *std::gmtime(&timestamp_seconds);
+
+    std::stringstream key;
+    key << command.transaction_id << '|' << std::put_time(&utc_time, "%Y%m%d%H%M%S");
+    return key.str();
+}
+
 class RdKafkaTransactionProducer::Impl {
 public:
     explicit Impl(const trading::config::KafkaConfig& config)
@@ -76,11 +89,16 @@ public:
 
     void publish(const trading::core::TransactionCommand& command) {
         const auto payload = serialize_transaction_command_payload(command);
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        const auto key = serialize_transaction_command_key(command, now_ms);
         const auto result = rd_kafka_producev(
             producer_,
             RD_KAFKA_V_TOPIC(topic_.c_str()),
             RD_KAFKA_V_PARTITION(RD_KAFKA_PARTITION_UA),
             RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+            RD_KAFKA_V_KEY(const_cast<char*>(key.data()), key.size()),
             RD_KAFKA_V_VALUE(const_cast<char*>(payload.data()), payload.size()),
             RD_KAFKA_V_END);
 
