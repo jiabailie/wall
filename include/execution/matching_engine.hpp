@@ -16,6 +16,9 @@ public:
     // Submits one order request and returns the resulting lifecycle updates and fills.
     [[nodiscard]] ExecutionResult submit(const trading::core::OrderRequest& request);
 
+    // Applies one external market event to resting local orders using executable book levels when available.
+    [[nodiscard]] ExecutionResult process_market_event(const trading::core::MarketEvent& event);
+
     // Cancels one currently resting order and returns the resulting lifecycle updates.
     [[nodiscard]] ExecutionResult cancel(const std::string& order_id, const std::string& client_order_id);
 
@@ -42,6 +45,7 @@ private:
                                const RestingOrder& resting) const;
     [[nodiscard]] bool is_terminal(trading::core::OrderStatus status) const;
     void apply_fill_to_order(const std::string& order_id, double executed_quantity);
+    void append_order_update(ExecutionResult& result, const std::string& order_id);
 
     std::unordered_map<std::string, OrderBook> books_;
     std::unordered_map<std::string, trading::storage::OrderRecord> orders_;
