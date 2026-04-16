@@ -15,6 +15,12 @@ public:
     // Submits one order request and returns the resulting lifecycle updates and fills.
     [[nodiscard]] ExecutionResult submit(const trading::core::OrderRequest& request);
 
+    // Restores one partially filled or fully resting order into the local book.
+    void restore_open_order(const std::string& order_id,
+                            const std::string& client_order_id,
+                            const trading::core::OrderRequest& request,
+                            double filled_quantity);
+
     // Returns the local book for an instrument when it exists.
     [[nodiscard]] const OrderBook* find_book(const std::string& instrument_id) const;
 

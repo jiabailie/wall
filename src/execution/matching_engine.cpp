@@ -93,6 +93,15 @@ ExecutionResult MatchingEngine::submit(const trading::core::OrderRequest& reques
     return result;
 }
 
+void MatchingEngine::restore_open_order(const std::string& order_id,
+                                        const std::string& client_order_id,
+                                        const trading::core::OrderRequest& request,
+                                        const double filled_quantity) {
+    auto& book = book_for(request.instrument);
+    const auto restored = book.add_order(request, order_id, client_order_id, filled_quantity);
+    static_cast<void>(restored);
+}
+
 const OrderBook* MatchingEngine::find_book(const std::string& instrument_id) const {
     const auto iterator = books_.find(instrument_id);
     if (iterator == books_.end()) {
