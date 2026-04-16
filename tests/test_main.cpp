@@ -13,6 +13,7 @@
 #include "exchange/exchange_router.hpp"
 #include "exchange/live_market_data_feed.hpp"
 #include "execution/live_execution_tracker.hpp"
+#include "execution/order_book.hpp"
 #include "execution/simulated_execution_engine.hpp"
 #include "infrastructure/postgres_repositories.hpp"
 #include "infrastructure/kafka_transaction_consumer.hpp"
@@ -1049,6 +1050,169 @@ void test_simulated_execution_engine_ack_and_fill() {
     expect_equal(result.updates[1].status, trading::core::OrderStatus::filled, "second update should fill");
     expect_equal(result.fills.size(), std::size_t {1}, "small order should produce one fill");
     expect_equal(result.fills[0].quantity, 0.25, "fill quantity should match request");
+}
+
+// Verifies the book tracks best bid and ask levels across multiple prices.
+void test_order_book_tracks_best_levels() {
+    trading::execution::OrderBook book(make_btc_instrument());
+
+    expect_true(book.add_order(
+        {
+            .request_id = "req-1",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.4,
+            .price = 42000.0,
+        },
+        "order-1",
+        "client-1"),
+        "first bid should be accepted");
+    expect_true(book.add_order(
+        {
+            .request_id = "req-2",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.2,
+            .price = 42100.0,
+        },
+        "order-2",
+        "client-2"),
+        "second bid should be accepted");
+    expect_true(book.add_order(
+        {
+            .request_id = "req-3",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::sell,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.3,
+            .price = 42200.0,
+        },
+        "order-3",
+        "client-3"),
+        "first ask should be accepted");
+    expect_true(book.add_order(
+        {
+            .request_id = "req-4",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::sell,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.6,
+            .price = 42300.0,
+        },
+        "order-4",
+        "client-4"),
+        "second ask should be accepted");
+
+    const auto best_bid = book.best_bid();
+    const auto best_ask = book.best_ask();
+    const auto bid_levels = book.bid_levels();
+    const auto ask_levels = book.ask_levels();
+
+    expect_true(best_bid.has_value(), "best bid should exist");
+    expect_true(best_ask.has_value(), "best ask should exist");
+    expect_equal(best_bid->price, 42100.0, "best bid price should be highest bid");
+    expect_equal(best_bid->total_quantity, 0.2, "best bid quantity should match resting quantity");
+    expect_equal(best_ask->price, 42200.0, "best ask price should be lowest ask");
+    expect_equal(best_ask->total_quantity, 0.3, "best ask quantity should match resting quantity");
+    expect_equal(bid_levels.size(), std::size_t {2}, "two bid levels should exist");
+    expect_equal(ask_levels.size(), std::size_t {2}, "two ask levels should exist");
+    expect_equal(book.order_count(), std::size_t {4}, "four resting orders should exist");
+}
+
+// Verifies same-price resting orders preserve insertion order inside one level.
+void test_order_book_preserves_fifo_within_price_level() {
+    trading::execution::OrderBook book(make_btc_instrument());
+
+    expect_true(book.add_order(
+        {
+            .request_id = "req-1",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.4,
+            .price = 42000.0,
+        },
+        "order-1",
+        "client-1"),
+        "first same-price order should be accepted");
+    expect_true(book.add_order(
+        {
+            .request_id = "req-2",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.6,
+            .price = 42000.0,
+        },
+        "order-2",
+        "client-2"),
+        "second same-price order should be accepted");
+
+    const auto first_order = book.find_order("order-1");
+    const auto second_order = book.find_order("order-2");
+    const auto best_bid = book.best_bid();
+
+    expect_true(first_order.has_value(), "first order should be findable");
+    expect_true(second_order.has_value(), "second order should be findable");
+    expect_true(first_order->sequence_number < second_order->sequence_number, "sequence number should preserve FIFO ordering");
+    expect_true(best_bid.has_value(), "best bid should exist");
+    expect_equal(best_bid->order_count, std::size_t {2}, "best price level should contain both same-price orders");
+    expect_equal(best_bid->total_quantity, 1.0, "same-price level quantity should aggregate");
+}
+
+// Verifies cancel removes the order and prunes empty levels.
+void test_order_book_cancel_prunes_empty_level() {
+    trading::execution::OrderBook book(make_btc_instrument());
+
+    expect_true(book.add_order(
+        {
+            .request_id = "req-1",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.4,
+            .price = 42100.0,
+        },
+        "order-1",
+        "client-1"),
+        "top bid should be accepted");
+    expect_true(book.add_order(
+        {
+            .request_id = "req-2",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.7,
+            .price = 42000.0,
+        },
+        "order-2",
+        "client-2"),
+        "second bid should be accepted");
+
+    expect_true(book.cancel_order("order-1"), "existing top-of-book order should cancel");
+    expect_true(!book.cancel_order("missing-order"), "missing order should not cancel");
+
+    const auto best_bid = book.best_bid();
+    const auto removed_order = book.find_order("order-1");
+    const auto remaining_order = book.find_order("order-2");
+    const auto bid_levels = book.bid_levels();
+
+    expect_true(best_bid.has_value(), "best bid should still exist after one cancel");
+    expect_equal(best_bid->price, 42000.0, "best bid should move to the next populated level");
+    expect_true(!removed_order.has_value(), "canceled order should no longer be findable");
+    expect_true(remaining_order.has_value(), "uncanceled order should remain");
+    expect_equal(bid_levels.size(), std::size_t {1}, "empty canceled level should be pruned");
+    expect_equal(book.order_count(), std::size_t {1}, "one resting order should remain after cancel");
 }
 
 // Verifies unsupported market orders are rejected by the simulator.
@@ -2798,6 +2962,9 @@ int main() {
         {"risk_engine_rejects_stale_market", test_risk_engine_rejects_stale_market},
         {"risk_engine_kill_switch_blocks_orders", test_risk_engine_kill_switch_blocks_orders},
         {"simulated_execution_engine_ack_and_fill", test_simulated_execution_engine_ack_and_fill},
+        {"order_book_tracks_best_levels", test_order_book_tracks_best_levels},
+        {"order_book_preserves_fifo_within_price_level", test_order_book_preserves_fifo_within_price_level},
+        {"order_book_cancel_prunes_empty_level", test_order_book_cancel_prunes_empty_level},
         {"simulated_execution_engine_rejects_market_order", test_simulated_execution_engine_rejects_market_order},
         {"simulated_execution_engine_partial_then_full_fill", test_simulated_execution_engine_partial_then_full_fill},
         {"simulated_execution_engine_cancel_open_order", test_simulated_execution_engine_cancel_open_order},

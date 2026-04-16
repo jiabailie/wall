@@ -39,6 +39,7 @@ add_library(trading_engine
     src/exchange/exchange_router.cpp
     src/exchange/live_market_data_feed.cpp
     src/execution/live_execution_tracker.cpp
+    src/execution/order_book.cpp
     src/execution/simulated_execution_engine.cpp
     src/infrastructure/postgres_repositories.cpp
     src/infrastructure/kafka_transaction_consumer.cpp
