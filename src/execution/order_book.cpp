@@ -137,6 +137,68 @@ std::optional<RestingOrder> OrderBook::find_order(const std::string& order_id) c
         : find_in_levels(ask_levels_);
 }
 
+std::optional<RestingOrder> OrderBook::best_bid_order() const {
+    if (bid_levels_.empty() || bid_levels_.begin()->second.empty()) {
+        return std::nullopt;
+    }
+
+    return bid_levels_.begin()->second.front();
+}
+
+std::optional<RestingOrder> OrderBook::best_ask_order() const {
+    if (ask_levels_.empty() || ask_levels_.begin()->second.empty()) {
+        return std::nullopt;
+    }
+
+    return ask_levels_.begin()->second.front();
+}
+
+bool OrderBook::apply_fill(const std::string& order_id, const double executed_quantity) {
+    if (executed_quantity <= 0.0) {
+        return false;
+    }
+
+    const auto locator_iterator = order_index_.find(order_id);
+    if (locator_iterator == order_index_.end()) {
+        return false;
+    }
+
+    auto apply_fill_to_levels = [&](auto& levels) {
+        const auto level_iterator = levels.find(locator_iterator->second.price);
+        if (level_iterator == levels.end()) {
+            return false;
+        }
+
+        auto& orders = level_iterator->second;
+        for (auto order_iterator = orders.begin(); order_iterator != orders.end(); ++order_iterator) {
+            if (order_iterator->order_id != order_id) {
+                continue;
+            }
+            if (executed_quantity > order_iterator->remaining_quantity) {
+                return false;
+            }
+
+            order_iterator->remaining_quantity -= executed_quantity;
+            if (order_iterator->remaining_quantity == 0.0) {
+                orders.erase(order_iterator);
+                order_index_.erase(locator_iterator);
+                --order_count_;
+                if (orders.empty()) {
+                    levels.erase(level_iterator);
+                }
+            }
+
+            return true;
+        }
+
+        return false;
+    };
+
+    return locator_iterator->second.side == trading::core::OrderSide::buy
+        ? apply_fill_to_levels(bid_levels_)
+        : apply_fill_to_levels(ask_levels_);
+}
+
 bool OrderBook::is_request_compatible(const trading::core::OrderRequest& request,
                                       const std::string& order_id,
                                       const std::string& client_order_id,

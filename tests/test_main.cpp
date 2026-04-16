@@ -13,6 +13,7 @@
 #include "exchange/exchange_router.hpp"
 #include "exchange/live_market_data_feed.hpp"
 #include "execution/live_execution_tracker.hpp"
+#include "execution/matching_engine.hpp"
 #include "execution/order_book.hpp"
 #include "execution/simulated_execution_engine.hpp"
 #include "infrastructure/postgres_repositories.hpp"
@@ -35,6 +36,7 @@
 #include "strategy/strategy_coordinator.hpp"
 
 #include <cstdlib>
+#include <cmath>
 #include <functional>
 #include <filesystem>
 #include <fstream>
@@ -207,6 +209,13 @@ void expect_true(const bool condition, const std::string& message) {
 template <typename T>
 void expect_equal(const T& actual, const T& expected, const std::string& message) {
     if (!(actual == expected)) {
+        throw std::runtime_error(message);
+    }
+}
+
+// Fails the current test when the two floating-point values differ beyond tolerance.
+void expect_near(const double actual, const double expected, const double tolerance, const std::string& message) {
+    if (std::abs(actual - expected) > tolerance) {
         throw std::runtime_error(message);
     }
 }
@@ -1213,6 +1222,179 @@ void test_order_book_cancel_prunes_empty_level() {
     expect_true(remaining_order.has_value(), "uncanceled order should remain");
     expect_equal(bid_levels.size(), std::size_t {1}, "empty canceled level should be pruned");
     expect_equal(book.order_count(), std::size_t {1}, "one resting order should remain after cancel");
+}
+
+// Verifies a crossing order fully matches the resting top of book.
+void test_matching_engine_fully_matches_crossing_order() {
+    trading::execution::MatchingEngine engine;
+
+    const auto resting_result = engine.submit({
+        .request_id = "req-1",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::sell,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.4,
+        .price = 42000.0,
+    });
+    const auto taker_result = engine.submit({
+        .request_id = "req-2",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.4,
+        .price = 42050.0,
+    });
+
+    const auto* book = engine.find_book(make_btc_instrument().instrument_id);
+
+    expect_equal(resting_result.updates.size(), std::size_t {1}, "non-crossing first order should only acknowledge");
+    expect_equal(taker_result.updates.size(), std::size_t {2}, "crossing order should ack then fill");
+    expect_equal(taker_result.updates[1].status, trading::core::OrderStatus::filled, "crossing order should fill");
+    expect_equal(taker_result.fills.size(), std::size_t {1}, "crossing order should emit one fill");
+    expect_equal(taker_result.fills[0].price, 42000.0, "fill price should use resting order price");
+    expect_equal(taker_result.fills[0].quantity, 0.4, "fill quantity should match the resting quantity");
+    expect_true(book != nullptr, "book should exist after matching");
+    expect_equal(book->order_count(), std::size_t {0}, "book should be empty after full match");
+}
+
+// Verifies partial matching leaves the residual quantity resting on the book.
+void test_matching_engine_partially_matches_and_rests_residual() {
+    trading::execution::MatchingEngine engine;
+
+    const auto ignored_resting_result = engine.submit({
+        .request_id = "req-1",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::sell,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.4,
+        .price = 42000.0,
+    });
+    static_cast<void>(ignored_resting_result);
+    const auto taker_result = engine.submit({
+        .request_id = "req-2",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 1.0,
+        .price = 42000.0,
+    });
+
+    const auto* book = engine.find_book(make_btc_instrument().instrument_id);
+    expect_true(book != nullptr, "book should exist after partial match");
+
+    const auto resting_taker_order = book->find_order(taker_result.order_id);
+    const auto best_bid = book->best_bid();
+    const auto best_ask = book->best_ask();
+
+    expect_equal(taker_result.updates.size(), std::size_t {2}, "partially matched order should ack then partially fill");
+    expect_equal(taker_result.updates[1].status, trading::core::OrderStatus::partially_filled, "terminal update should be partial");
+    expect_equal(taker_result.updates[1].filled_quantity, 0.4, "filled quantity should match executed amount");
+    expect_equal(taker_result.fills.size(), std::size_t {1}, "partial match should emit one fill");
+    expect_true(resting_taker_order.has_value(), "residual quantity should rest on the book");
+    expect_equal(resting_taker_order->remaining_quantity, 0.6, "resting residual should equal remaining quantity");
+    expect_true(best_bid.has_value(), "residual should become top bid");
+    expect_equal(best_bid->price, 42000.0, "resting residual price should remain on the incoming limit price");
+    expect_equal(best_bid->total_quantity, 0.6, "residual best bid quantity should match remaining quantity");
+    expect_true(!best_ask.has_value(), "all opposing liquidity should be consumed");
+}
+
+// Verifies a crossing order sweeps multiple resting levels in price-time order.
+void test_matching_engine_sweeps_multiple_levels_in_price_time_order() {
+    trading::execution::MatchingEngine engine;
+
+    const auto first_resting = engine.submit({
+        .request_id = "req-1",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::sell,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.2,
+        .price = 42000.0,
+    });
+    const auto second_resting = engine.submit({
+        .request_id = "req-2",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::sell,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.3,
+        .price = 42000.0,
+    });
+    const auto ignored_third_resting = engine.submit({
+        .request_id = "req-3",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::sell,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.4,
+        .price = 42100.0,
+    });
+    static_cast<void>(ignored_third_resting);
+    const auto taker_result = engine.submit({
+        .request_id = "req-4",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.7,
+        .price = 42100.0,
+    });
+
+    const auto* book = engine.find_book(make_btc_instrument().instrument_id);
+    expect_true(book != nullptr, "book should exist after sweep");
+
+    expect_equal(taker_result.updates.size(), std::size_t {2}, "sweeping order should ack then fill");
+    expect_equal(taker_result.updates[1].status, trading::core::OrderStatus::filled, "sweep should fully fill incoming order");
+    expect_equal(taker_result.fills.size(), std::size_t {3}, "sweep should produce one fill per matched resting order");
+    expect_near(taker_result.fills[0].quantity, 0.2, 1e-9, "first FIFO match should use the first same-price order");
+    expect_near(taker_result.fills[1].quantity, 0.3, 1e-9, "second FIFO match should use the second same-price order");
+    expect_near(taker_result.fills[2].quantity, 0.2, 1e-9, "final match should consume part of the next price level");
+    expect_equal(taker_result.fills[0].price, 42000.0, "first fill price should match the best resting ask");
+    expect_equal(taker_result.fills[1].price, 42000.0, "second fill price should preserve same-price FIFO");
+    expect_equal(taker_result.fills[2].price, 42100.0, "third fill price should move to the next ask level");
+    expect_true(!book->find_order(first_resting.order_id).has_value(), "first same-price resting order should be consumed");
+    expect_true(!book->find_order(second_resting.order_id).has_value(), "second same-price resting order should be consumed");
+    const auto best_ask = book->best_ask();
+    expect_true(best_ask.has_value(), "partially consumed next level should remain");
+    expect_equal(best_ask->price, 42100.0, "remaining ask should stay on the partially consumed level");
+    expect_near(best_ask->total_quantity, 0.2, 1e-9, "remaining ask quantity should reflect the residual");
+}
+
+// Verifies non-crossing orders rest on the book without fills.
+void test_matching_engine_leaves_non_crossing_order_resting() {
+    trading::execution::MatchingEngine engine;
+
+    const auto ignored_resting_result = engine.submit({
+        .request_id = "req-1",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::sell,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.4,
+        .price = 42100.0,
+    });
+    static_cast<void>(ignored_resting_result);
+    const auto result = engine.submit({
+        .request_id = "req-2",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.5,
+        .price = 42000.0,
+    });
+
+    const auto* book = engine.find_book(make_btc_instrument().instrument_id);
+    expect_true(book != nullptr, "book should exist after resting order");
+
+    expect_equal(result.updates.size(), std::size_t {1}, "non-crossing order should only acknowledge");
+    expect_equal(result.fills.size(), std::size_t {0}, "non-crossing order should not fill");
+    expect_true(book->find_order(result.order_id).has_value(), "non-crossing order should rest on the book");
+    expect_equal(book->order_count(), std::size_t {2}, "both sides should remain resting");
 }
 
 // Verifies unsupported market orders are rejected by the simulator.
@@ -2965,6 +3147,10 @@ int main() {
         {"order_book_tracks_best_levels", test_order_book_tracks_best_levels},
         {"order_book_preserves_fifo_within_price_level", test_order_book_preserves_fifo_within_price_level},
         {"order_book_cancel_prunes_empty_level", test_order_book_cancel_prunes_empty_level},
+        {"matching_engine_fully_matches_crossing_order", test_matching_engine_fully_matches_crossing_order},
+        {"matching_engine_partially_matches_and_rests_residual", test_matching_engine_partially_matches_and_rests_residual},
+        {"matching_engine_sweeps_multiple_levels_in_price_time_order", test_matching_engine_sweeps_multiple_levels_in_price_time_order},
+        {"matching_engine_leaves_non_crossing_order_resting", test_matching_engine_leaves_non_crossing_order_resting},
         {"simulated_execution_engine_rejects_market_order", test_simulated_execution_engine_rejects_market_order},
         {"simulated_execution_engine_partial_then_full_fill", test_simulated_execution_engine_partial_then_full_fill},
         {"simulated_execution_engine_cancel_open_order", test_simulated_execution_engine_cancel_open_order},

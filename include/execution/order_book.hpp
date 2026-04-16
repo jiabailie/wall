@@ -57,6 +57,15 @@ public:
     // Returns one resting order when it exists.
     [[nodiscard]] std::optional<RestingOrder> find_order(const std::string& order_id) const;
 
+    // Returns the current top resting bid order, if present.
+    [[nodiscard]] std::optional<RestingOrder> best_bid_order() const;
+
+    // Returns the current top resting ask order, if present.
+    [[nodiscard]] std::optional<RestingOrder> best_ask_order() const;
+
+    // Applies executed quantity to one resting order and removes it when fully consumed.
+    [[nodiscard]] bool apply_fill(const std::string& order_id, double executed_quantity);
+
     // Returns the number of currently resting orders.
     [[nodiscard]] std::size_t order_count() const { return order_count_; }
 
