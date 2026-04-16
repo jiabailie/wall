@@ -1645,6 +1645,157 @@ void test_matching_engine_restore_open_order_skips_invalid_state() {
     expect_true(book == nullptr || book->order_count() == 0, "invalid restore attempts should not leave resting orders");
 }
 
+// Verifies market book snapshots can fill resting local orders from external ask liquidity.
+void test_matching_engine_processes_market_ask_levels_against_resting_bids() {
+    trading::execution::MatchingEngine engine;
+
+    log_test_step("restore resting local buy order");
+    engine.restore_open_order(
+        "resting-buy-1",
+        "resting-client-1",
+        {
+            .request_id = "req-restore-1",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 1.0,
+            .price = 42000.0,
+        },
+        0.0);
+
+    log_test_step("apply external ask-side book snapshot");
+    const auto result = engine.process_market_event({
+        .event_id = "book-1",
+        .type = trading::core::MarketEventType::book_snapshot,
+        .instrument = make_btc_instrument(),
+        .ask_levels = {
+            {.price = 41990.0, .quantity = 0.4},
+            {.price = 42000.0, .quantity = 0.3},
+        },
+        .process_timestamp = 1000,
+    });
+
+    log_test_step("verify external ask liquidity partially fills the resting buy order");
+    expect_equal(result.fills.size(), std::size_t {2}, "two executable ask levels should produce two fills");
+    expect_equal(result.fills[0].order_id, std::string("resting-buy-1"), "fills should be attributed to the resting local order");
+    expect_equal(result.fills[0].side, trading::core::OrderSide::buy, "resting local buy should emit buy-side fill");
+    expect_equal(result.fills[0].price, 41990.0, "first fill should use first ask level price");
+    expect_equal(result.fills[1].price, 42000.0, "second fill should use second ask level price");
+    expect_near(result.fills[0].quantity, 0.4, 1e-9, "first fill quantity should match first ask level quantity");
+    expect_near(result.fills[1].quantity, 0.3, 1e-9, "second fill quantity should match second ask level quantity");
+    expect_equal(result.updates.size(), std::size_t {1}, "one resting order update should be emitted");
+    expect_equal(result.updates[0].status, trading::core::OrderStatus::partially_filled, "resting buy order should become partially filled");
+    expect_near(result.updates[0].filled_quantity, 0.7, 1e-9, "cumulative filled quantity should aggregate across ask levels");
+    const auto order = engine.get_order("resting-buy-1");
+    expect_true(order.has_value(), "resting order should remain tracked after market-driven partial fill");
+    expect_equal(order->status, trading::core::OrderStatus::partially_filled, "tracked order state should reflect market-driven partial fill");
+    expect_near(order->filled_quantity, 0.7, 1e-9, "tracked filled quantity should aggregate market-driven fills");
+}
+
+// Verifies market book snapshots can fill resting local sell orders from external bid liquidity.
+void test_matching_engine_processes_market_bid_levels_against_resting_asks() {
+    trading::execution::MatchingEngine engine;
+
+    log_test_step("restore resting local sell order");
+    engine.restore_open_order(
+        "resting-sell-1",
+        "resting-client-1",
+        {
+            .request_id = "req-restore-1",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::sell,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.5,
+            .price = 42010.0,
+        },
+        0.0);
+
+    log_test_step("apply external bid-side book snapshot");
+    const auto result = engine.process_market_event({
+        .event_id = "book-1",
+        .type = trading::core::MarketEventType::book_snapshot,
+        .instrument = make_btc_instrument(),
+        .bid_levels = {
+            {.price = 42020.0, .quantity = 0.5},
+        },
+        .process_timestamp = 1000,
+    });
+
+    log_test_step("verify external bid liquidity fully fills the resting sell order");
+    expect_equal(result.fills.size(), std::size_t {1}, "one executable bid level should produce one fill");
+    expect_equal(result.fills[0].order_id, std::string("resting-sell-1"), "fill should be attributed to the resting local sell order");
+    expect_equal(result.fills[0].side, trading::core::OrderSide::sell, "resting local sell should emit sell-side fill");
+    expect_equal(result.fills[0].price, 42020.0, "fill should use external bid level price");
+    expect_near(result.fills[0].quantity, 0.5, 1e-9, "fill quantity should match remaining resting sell quantity");
+    expect_equal(result.updates.size(), std::size_t {1}, "one resting sell update should be emitted");
+    expect_equal(result.updates[0].status, trading::core::OrderStatus::filled, "resting sell order should become filled");
+    const auto order = engine.get_order("resting-sell-1");
+    expect_true(order.has_value(), "filled resting sell should remain tracked");
+    expect_equal(order->status, trading::core::OrderStatus::filled, "tracked resting sell should become filled");
+}
+
+// Verifies runtime applies market-driven fills from external book snapshots into portfolio state.
+void test_simulation_runtime_market_event_applies_market_driven_fill() {
+    trading::core::FixedClock clock(5000);
+    trading::app::SimulationRuntime runtime(
+        clock,
+        {
+            .max_order_quantity = 1.0,
+            .max_order_notional = 50000.0,
+            .max_position_quantity = 2.0,
+            .stale_after_ms = 1000,
+            .kill_switch_enabled = false,
+        },
+        {
+            .strategy = {
+                .strategy_id = "threshold-1",
+                .instrument_id = "binance:BTCUSDT",
+                .trigger_price = 41000.0,
+                .order_quantity = 0.05,
+                .side = trading::core::OrderSide::buy,
+            },
+            .execution = {
+                .partial_fill_threshold = 1.0,
+                .partial_fill_ratio = 0.5,
+            },
+            .auto_complete_partial_fills = false,
+        });
+
+    log_test_step("restore resting local buy order for market-driven fill");
+    runtime.restore_open_order({
+        .order_id = "resting-buy-1",
+        .client_order_id = "resting-client-1",
+        .strategy_id = "maker-1",
+        .instrument_id = "binance:BTCUSDT",
+        .side = trading::core::OrderSide::buy,
+        .order_type = trading::core::OrderType::limit,
+        .status = trading::core::OrderStatus::acknowledged,
+        .quantity = 0.4,
+        .price = 42000.0,
+        .filled_quantity = 0.0,
+    });
+
+    log_test_step("process external book snapshot through simulation runtime");
+    runtime.on_event(trading::core::MarketEvent {
+        .event_id = "book-1",
+        .type = trading::core::MarketEventType::book_snapshot,
+        .instrument = make_btc_instrument(),
+        .ask_levels = {
+            {.price = 41995.0, .quantity = 0.4},
+        },
+        .process_timestamp = 4900,
+    });
+
+    log_test_step("verify market-driven fill is applied into portfolio");
+    expect_equal(runtime.applied_fill_count(), std::size_t {1}, "market-driven book snapshot should apply one fill");
+    const auto position = runtime.portfolio().get_position("binance:BTCUSDT");
+    expect_true(position.has_value(), "market-driven fill should open a position");
+    expect_near(position->net_quantity, 0.4, 1e-9, "position quantity should match market-driven fill quantity");
+    expect_near(position->average_entry_price, 41995.0, 1e-9, "position entry price should use external ask level price");
+}
+
 // Verifies unsupported market orders are rejected by the simulator.
 void test_simulated_execution_engine_rejects_market_order() {
     trading::execution::SimulatedExecutionEngine execution_engine({
@@ -3555,6 +3706,8 @@ int main() {
         {"matching_engine_rejects_invalid_limit_requests", test_matching_engine_rejects_invalid_limit_requests},
         {"matching_engine_rejects_cancel_for_terminal_order", test_matching_engine_rejects_cancel_for_terminal_order},
         {"matching_engine_restore_open_order_skips_invalid_state", test_matching_engine_restore_open_order_skips_invalid_state},
+        {"matching_engine_processes_market_ask_levels_against_resting_bids", test_matching_engine_processes_market_ask_levels_against_resting_bids},
+        {"matching_engine_processes_market_bid_levels_against_resting_asks", test_matching_engine_processes_market_bid_levels_against_resting_asks},
         {"simulated_execution_engine_rejects_market_order", test_simulated_execution_engine_rejects_market_order},
         {"simulated_execution_engine_partial_then_full_fill", test_simulated_execution_engine_partial_then_full_fill},
         {"simulated_execution_engine_cancel_open_order", test_simulated_execution_engine_cancel_open_order},
@@ -3569,6 +3722,7 @@ int main() {
         {"simulation_runtime_happy_path", test_simulation_runtime_happy_path},
         {"simulation_runtime_risk_rejection_stops_execution", test_simulation_runtime_risk_rejection_stops_execution},
         {"simulation_runtime_applies_partial_match_fill", test_simulation_runtime_applies_partial_match_fill},
+        {"simulation_runtime_market_event_applies_market_driven_fill", test_simulation_runtime_market_event_applies_market_driven_fill},
         {"simulation_runtime_pause_trading_blocks_orders", test_simulation_runtime_pause_trading_blocks_orders},
         {"simulation_runtime_records_metrics", test_simulation_runtime_records_metrics},
         {"in_memory_order_repository_save_and_update", test_in_memory_order_repository_save_and_update},

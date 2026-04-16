@@ -129,6 +129,95 @@ ExecutionResult MatchingEngine::submit(const trading::core::OrderRequest& reques
     return result;
 }
 
+ExecutionResult MatchingEngine::process_market_event(const trading::core::MarketEvent& event) {
+    ExecutionResult result;
+
+    const auto book_iterator = books_.find(event.instrument.instrument_id);
+    if (book_iterator == books_.end()) {
+        return result;
+    }
+
+    auto& book = book_iterator->second;
+    std::vector<std::string> touched_orders;
+
+    const auto process_buy_resting_orders = [&](const std::vector<trading::core::BookLevel>& ask_levels) {
+        for (const auto& level : ask_levels) {
+            double available_quantity = level.quantity;
+            while (available_quantity > kQuantityTolerance) {
+                const auto resting_order = book.best_bid_order();
+                if (!resting_order.has_value()) {
+                    break;
+                }
+                if (!resting_order->request.price.has_value() || *resting_order->request.price + kQuantityTolerance < level.price) {
+                    break;
+                }
+
+                const auto executed_quantity = std::min(available_quantity, resting_order->remaining_quantity);
+                if (!book.apply_fill(resting_order->order_id, executed_quantity)) {
+                    break;
+                }
+
+                apply_fill_to_order(resting_order->order_id, executed_quantity);
+                result.fills.push_back({
+                    .fill_id = "match-fill-" + std::to_string(next_fill_id_++),
+                    .order_id = resting_order->order_id,
+                    .instrument = resting_order->request.instrument,
+                    .side = resting_order->request.side,
+                    .price = level.price,
+                    .quantity = executed_quantity,
+                    .fee = 0.0,
+                });
+                touched_orders.push_back(resting_order->order_id);
+                available_quantity = std::max(0.0, available_quantity - executed_quantity);
+            }
+        }
+    };
+
+    const auto process_sell_resting_orders = [&](const std::vector<trading::core::BookLevel>& bid_levels) {
+        for (const auto& level : bid_levels) {
+            double available_quantity = level.quantity;
+            while (available_quantity > kQuantityTolerance) {
+                const auto resting_order = book.best_ask_order();
+                if (!resting_order.has_value()) {
+                    break;
+                }
+                if (!resting_order->request.price.has_value() || *resting_order->request.price - kQuantityTolerance > level.price) {
+                    break;
+                }
+
+                const auto executed_quantity = std::min(available_quantity, resting_order->remaining_quantity);
+                if (!book.apply_fill(resting_order->order_id, executed_quantity)) {
+                    break;
+                }
+
+                apply_fill_to_order(resting_order->order_id, executed_quantity);
+                result.fills.push_back({
+                    .fill_id = "match-fill-" + std::to_string(next_fill_id_++),
+                    .order_id = resting_order->order_id,
+                    .instrument = resting_order->request.instrument,
+                    .side = resting_order->request.side,
+                    .price = level.price,
+                    .quantity = executed_quantity,
+                    .fee = 0.0,
+                });
+                touched_orders.push_back(resting_order->order_id);
+                available_quantity = std::max(0.0, available_quantity - executed_quantity);
+            }
+        }
+    };
+
+    process_buy_resting_orders(event.ask_levels);
+    process_sell_resting_orders(event.bid_levels);
+
+    std::sort(touched_orders.begin(), touched_orders.end());
+    touched_orders.erase(std::unique(touched_orders.begin(), touched_orders.end()), touched_orders.end());
+    for (const auto& order_id : touched_orders) {
+        append_order_update(result, order_id);
+    }
+
+    return result;
+}
+
 ExecutionResult MatchingEngine::cancel(const std::string& order_id, const std::string& client_order_id) {
     ExecutionResult result {
         .order_id = order_id,
@@ -286,6 +375,19 @@ void MatchingEngine::apply_fill_to_order(const std::string& order_id, const doub
     order.status = order.filled_quantity >= (order.quantity - kQuantityTolerance)
         ? trading::core::OrderStatus::filled
         : trading::core::OrderStatus::partially_filled;
+}
+
+void MatchingEngine::append_order_update(ExecutionResult& result, const std::string& order_id) {
+    const auto iterator = orders_.find(order_id);
+    if (iterator == orders_.end()) {
+        return;
+    }
+
+    result.updates.push_back(make_update(
+        iterator->second.order_id,
+        iterator->second.client_order_id,
+        iterator->second.status,
+        iterator->second.filled_quantity));
 }
 
 }  // namespace trading::execution

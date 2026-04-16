@@ -35,6 +35,7 @@ void SimulationRuntime::on_event(const trading::core::EngineEvent& event) {
     const auto event_started_ms = clock_.now_ms();
     if (const auto* market_event = std::get_if<trading::core::MarketEvent>(&event)) {
         market_state_store_.apply(*market_event);
+        handle_execution_result(execution_engine_.process_market_event(*market_event));
         if (market_event->price > 0.0) {
             portfolio_service_.set_mark_price(market_event->instrument.instrument_id, market_event->price);
         }
