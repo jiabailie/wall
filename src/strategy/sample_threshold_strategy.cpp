@@ -25,7 +25,7 @@ std::vector<trading::core::OrderRequest> SampleThresholdStrategy::on_event(
             }
 
             if (should_emit_for_trade_price(concrete_event.price)) {
-                requests.push_back(build_order_request(concrete_event.price));
+                requests.push_back(build_order_request(concrete_event.instrument, concrete_event.price));
                 has_emitted_signal_ = true;
             }
         } else if constexpr (std::is_same_v<EventType, trading::core::TransactionCommand>) {
@@ -52,18 +52,20 @@ bool SampleThresholdStrategy::should_emit_for_trade_price(const double trade_pri
 }
 
 // Builds one stable order request for the configured instrument and side.
-trading::core::OrderRequest SampleThresholdStrategy::build_order_request(const double trade_price) {
+trading::core::OrderRequest SampleThresholdStrategy::build_order_request(const trading::core::Instrument& instrument,
+                                                                         const double trade_price) {
     std::stringstream request_id;
     request_id << config_.strategy_id << "-request-" << next_request_id_++;
+
+    const auto resolved_instrument = config_.instrument.instrument_id.empty()
+        || (config_.instrument.base_asset.empty() && config_.instrument.quote_asset.empty())
+        ? instrument
+        : config_.instrument;
 
     return {
         .request_id = request_id.str(),
         .strategy_id = config_.strategy_id,
-        .instrument = config_.instrument.instrument_id.empty()
-            ? trading::core::Instrument {
-                .instrument_id = config_.instrument_id,
-            }
-            : config_.instrument,
+        .instrument = resolved_instrument,
         .side = config_.side,
         .type = trading::core::OrderType::limit,
         .quantity = config_.order_quantity,

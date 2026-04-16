@@ -24,6 +24,11 @@ struct SimulationRuntimeConfig {
     std::shared_ptr<trading::strategy::StrategyCoordinator> strategy_coordinator;
     trading::execution::SimulatedExecutionConfig execution;
     bool auto_complete_partial_fills {false};
+    trading::storage::IOrderRepository* order_repository {nullptr};
+    trading::storage::IFillRepository* fill_repository {nullptr};
+    trading::storage::IPositionRepository* position_repository {nullptr};
+    trading::storage::IBalanceRepository* balance_repository {nullptr};
+    trading::storage::IMarketStateCache* market_state_cache {nullptr};
 };
 
 // Wires the full event pipeline for local simulation runs.
@@ -83,6 +88,9 @@ public:
 
 private:
     void handle_execution_result(const trading::execution::ExecutionResult& result);
+    void persist_new_order(const trading::core::OrderRequest& request,
+                           const trading::execution::ExecutionResult& result);
+    void persist_market_snapshot(const trading::core::MarketEvent& event);
 
     const trading::core::IClock& clock_;
     trading::market_data::MarketStateStore market_state_store_;
@@ -91,6 +99,11 @@ private:
     trading::risk::RiskEngine risk_engine_;
     trading::portfolio::PortfolioService portfolio_service_;
     trading::execution::MatchingEngine execution_engine_;
+    trading::storage::IOrderRepository* order_repository_ {nullptr};
+    trading::storage::IFillRepository* fill_repository_ {nullptr};
+    trading::storage::IPositionRepository* position_repository_ {nullptr};
+    trading::storage::IBalanceRepository* balance_repository_ {nullptr};
+    trading::storage::IMarketStateCache* market_state_cache_ {nullptr};
     RuntimeOperationalControls* controls_ {nullptr};
     trading::monitoring::IMetricsCollector* metrics_ {nullptr};
     bool auto_complete_partial_fills_ {false};

@@ -158,10 +158,14 @@ ExecutionResult MatchingEngine::process_market_event(const trading::core::Market
                 }
 
                 apply_fill_to_order(resting_order->order_id, executed_quantity);
+                const auto fill_instrument = resting_order->request.instrument.base_asset.empty()
+                        && resting_order->request.instrument.quote_asset.empty()
+                    ? event.instrument
+                    : resting_order->request.instrument;
                 result.fills.push_back({
                     .fill_id = "match-fill-" + std::to_string(next_fill_id_++),
                     .order_id = resting_order->order_id,
-                    .instrument = resting_order->request.instrument,
+                    .instrument = fill_instrument,
                     .side = resting_order->request.side,
                     .price = level.price,
                     .quantity = executed_quantity,
@@ -191,10 +195,14 @@ ExecutionResult MatchingEngine::process_market_event(const trading::core::Market
                 }
 
                 apply_fill_to_order(resting_order->order_id, executed_quantity);
+                const auto fill_instrument = resting_order->request.instrument.base_asset.empty()
+                        && resting_order->request.instrument.quote_asset.empty()
+                    ? event.instrument
+                    : resting_order->request.instrument;
                 result.fills.push_back({
                     .fill_id = "match-fill-" + std::to_string(next_fill_id_++),
                     .order_id = resting_order->order_id,
-                    .instrument = resting_order->request.instrument,
+                    .instrument = fill_instrument,
                     .side = resting_order->request.side,
                     .price = level.price,
                     .quantity = executed_quantity,

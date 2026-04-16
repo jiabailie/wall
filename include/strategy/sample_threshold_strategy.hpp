@@ -29,7 +29,8 @@ public:
 
 private:
     [[nodiscard]] bool should_emit_for_trade_price(double trade_price) const;
-    [[nodiscard]] trading::core::OrderRequest build_order_request(double trade_price);
+    [[nodiscard]] trading::core::OrderRequest build_order_request(const trading::core::Instrument& instrument,
+                                                                  double trade_price);
 
     SampleThresholdStrategyConfig config_;
     bool has_emitted_signal_ {false};
