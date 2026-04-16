@@ -27,6 +27,7 @@ docker compose -f wall/docker-compose.yml up -d
 cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
+./build/wall_benchmark
 ./build/wall
 ./build/wall_tx_producer configs/sample_transactions.jsonl
 ```
@@ -213,6 +214,7 @@ The project uses these Docker components:
 
 - Kafka for inbound transaction messages
 - Zookeeper for Kafka coordination
+- Redpanda Console for Kafka topic and message inspection
 - Redis for low-latency cache state
 - PostgreSQL for durable data
 
@@ -234,6 +236,7 @@ Expected services:
 - `postgres`
 - `zookeeper`
 - `kafka`
+- `redpanda-console`
 
 To stop the containers later:
 
@@ -280,6 +283,7 @@ This creates:
 
 - `build/wall`
 - `build/wall_tests`
+- `build/wall_benchmark`
 - `build/wall_replay`
 - `build/wall_tx_producer`
 
@@ -303,7 +307,54 @@ The current tests verify:
 - producer payload serialization and JSON transaction parsing
 - invalid transaction rejection behavior
 
-### Step 5: Publish Transactions To Kafka
+### Step 5: Run The Ingestion Benchmark
+
+Run the dedicated benchmark executable from the project root:
+
+```bash
+./build/wall_benchmark
+```
+
+This benchmark:
+
+- exercises `TransactionIngestor::process_next()` against in-memory boundaries
+- prints per-step timings for poll, persistence, cache updates, dispatch, and commit
+- reports average and max durations for each measured step
+
+The default run uses `2000` transactions. To change the sample size, pass the iteration count as the first argument:
+
+```bash
+./build/wall_benchmark 10000
+```
+
+Example output shape:
+
+```text
+[BENCH] transaction_ingestor_step_benchmark iterations=2000
+[BENCH] process_next_total calls=2000 avg_us=66.121 max_us=622.958 total_ms=132.243
+[BENCH] step_1_poll calls=2000 avg_us=0.079 max_us=0.416 total_ms=0.159
+[BENCH] step_2_save_received calls=2000 avg_us=0.604 max_us=200.167 total_ms=1.208
+```
+
+Use this benchmark to compare relative step costs inside the ingestion path. Because it runs in-process against local machine resources, the exact numbers will vary by hardware and system load.
+
+### Step 6: Open Redpanda Console For Kafka Inspection
+
+After the Docker stack is running, open Redpanda Console in your browser:
+
+```text
+http://localhost:8080
+```
+
+Use it to inspect Kafka locally:
+
+- open the `Topics` page to see available topics
+- select `trading-transactions` to inspect partitions, offsets, and retained messages
+- use the consumer-group view to inspect the `trading-engine` group when the engine is running
+
+This does not replace Kafka in the stack. It is only a UI connected to the existing local broker at `kafka:29092`.
+
+### Step 7: Publish Transactions To Kafka
 
 Sample transaction fixtures are stored in:
 
@@ -367,7 +418,7 @@ In fallback mode, startup logs include:
 
 This lets local development continue even when Docker services are not running.
 
-### Step 7: Shut Everything Down
+### Step 9: Shut Everything Down
 
 When you are done:
 
@@ -391,6 +442,19 @@ Current status:
 - native Kafka consumer and producer adapters are implemented
 - live engine wiring to consume Kafka continuously is still incomplete
 - the main app falls back to local startup mode when Kafka is unavailable
+
+### Redpanda Console
+
+Container role:
+
+- provides a browser UI for inspecting Kafka topics, partitions, offsets, and consumer groups
+- helps verify that transaction messages were published into Kafka during local development
+
+Current status:
+
+- Docker service is available
+- connects to the existing Kafka broker inside the local Docker network
+- exposed locally at `http://localhost:8080`
 
 ### Redis
 
@@ -437,7 +501,7 @@ A shell helper is also available at:
 Before using it, start the Docker infrastructure:
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d
+docker compose -f wall/docker-compose.yml up -d
 ```
 
 Then publish the default sample transactions with the C++ producer:
@@ -457,6 +521,12 @@ The producer application:
 - reads line-delimited JSON transactions from a local file
 - parses each line into a transaction command
 - publishes each command to the configured Kafka topic using `librdkafka`
+
+After publishing, you can verify the messages in Redpanda Console:
+
+- open `http://localhost:8080`
+- navigate to the `trading-transactions` topic
+- inspect the latest records and offsets
 
 The shell helper script:
 
