@@ -1531,6 +1531,120 @@ void test_matching_engine_tracks_order_lifecycle_state() {
     expect_equal(taker_order->filled_quantity, 0.4, "taker cumulative filled quantity should match executed volume");
 }
 
+// Verifies invalid matching-engine requests are rejected cleanly.
+void test_matching_engine_rejects_invalid_limit_requests() {
+    trading::execution::MatchingEngine engine;
+
+    log_test_step("submit zero-quantity limit order");
+    const auto zero_quantity_result = engine.submit({
+        .request_id = "req-1",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.0,
+        .price = 42000.0,
+    });
+    log_test_step("submit zero-price limit order");
+    const auto zero_price_result = engine.submit({
+        .request_id = "req-2",
+        .strategy_id = "strategy-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.1,
+        .price = 0.0,
+    });
+
+    log_test_step("verify rejected lifecycle state for invalid orders");
+    expect_equal(zero_quantity_result.updates.size(), std::size_t {1}, "zero-quantity order should reject immediately");
+    expect_equal(zero_quantity_result.updates[0].status, trading::core::OrderStatus::rejected, "zero-quantity order should be rejected");
+    expect_equal(zero_price_result.updates.size(), std::size_t {1}, "zero-price order should reject immediately");
+    expect_equal(zero_price_result.updates[0].status, trading::core::OrderStatus::rejected, "zero-price order should be rejected");
+    const auto zero_quantity_order = engine.get_order(zero_quantity_result.order_id);
+    const auto zero_price_order = engine.get_order(zero_price_result.order_id);
+    expect_true(zero_quantity_order.has_value(), "rejected zero-quantity order should remain queryable");
+    expect_true(zero_price_order.has_value(), "rejected zero-price order should remain queryable");
+    expect_equal(zero_quantity_order->status, trading::core::OrderStatus::rejected, "tracked zero-quantity order should remain rejected");
+    expect_equal(zero_price_order->status, trading::core::OrderStatus::rejected, "tracked zero-price order should remain rejected");
+}
+
+// Verifies terminal orders cannot be canceled after they are fully filled.
+void test_matching_engine_rejects_cancel_for_terminal_order() {
+    trading::execution::MatchingEngine engine;
+
+    log_test_step("submit resting sell then fully crossing buy order");
+    const auto resting_result = engine.submit({
+        .request_id = "req-1",
+        .strategy_id = "maker-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::sell,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.4,
+        .price = 42000.0,
+    });
+    const auto taker_result = engine.submit({
+        .request_id = "req-2",
+        .strategy_id = "taker-1",
+        .instrument = make_btc_instrument(),
+        .side = trading::core::OrderSide::buy,
+        .type = trading::core::OrderType::limit,
+        .quantity = 0.4,
+        .price = 42000.0,
+    });
+    static_cast<void>(taker_result);
+
+    log_test_step("attempt cancel on terminal filled maker order");
+    const auto cancel_result = engine.cancel(resting_result.order_id, resting_result.client_order_id);
+
+    log_test_step("verify cancel rejection preserves filled quantity");
+    expect_equal(cancel_result.updates.size(), std::size_t {1}, "terminal cancel should return one rejection update");
+    expect_equal(cancel_result.updates[0].status, trading::core::OrderStatus::rejected, "terminal order cancel should reject");
+    expect_true(cancel_result.updates[0].reason.has_value(), "terminal cancel rejection should include a reason");
+    expect_equal(*cancel_result.updates[0].reason, std::string("order is not cancelable"), "terminal cancel reason should match");
+    expect_equal(cancel_result.updates[0].filled_quantity, 0.4, "terminal cancel rejection should preserve cumulative filled quantity");
+}
+
+// Verifies invalid open-order recovery input does not leak into tracked state or the book.
+void test_matching_engine_restore_open_order_skips_invalid_state() {
+    trading::execution::MatchingEngine engine;
+
+    log_test_step("attempt restore with fully filled quantity");
+    engine.restore_open_order(
+        "restored-order-1",
+        "restored-client-1",
+        {
+            .request_id = "req-restore-1",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.5,
+            .price = 42000.0,
+        },
+        0.5);
+    log_test_step("attempt restore with invalid price");
+    engine.restore_open_order(
+        "restored-order-2",
+        "restored-client-2",
+        {
+            .request_id = "req-restore-2",
+            .strategy_id = "strategy-1",
+            .instrument = make_btc_instrument(),
+            .side = trading::core::OrderSide::buy,
+            .type = trading::core::OrderType::limit,
+            .quantity = 0.5,
+            .price = 0.0,
+        },
+        0.0);
+
+    log_test_step("verify invalid restore attempts do not populate tracked order state");
+    expect_true(!engine.get_order("restored-order-1").has_value(), "fully filled restore input should be ignored");
+    expect_true(!engine.get_order("restored-order-2").has_value(), "invalid-price restore input should be ignored");
+    const auto* book = engine.find_book(make_btc_instrument().instrument_id);
+    expect_true(book == nullptr || book->order_count() == 0, "invalid restore attempts should not leave resting orders");
+}
+
 // Verifies unsupported market orders are rejected by the simulator.
 void test_simulated_execution_engine_rejects_market_order() {
     trading::execution::SimulatedExecutionEngine execution_engine({
@@ -3438,6 +3552,9 @@ int main() {
         {"matching_engine_cancels_resting_order", test_matching_engine_cancels_resting_order},
         {"matching_engine_cancels_partially_filled_resting_order", test_matching_engine_cancels_partially_filled_resting_order},
         {"matching_engine_tracks_order_lifecycle_state", test_matching_engine_tracks_order_lifecycle_state},
+        {"matching_engine_rejects_invalid_limit_requests", test_matching_engine_rejects_invalid_limit_requests},
+        {"matching_engine_rejects_cancel_for_terminal_order", test_matching_engine_rejects_cancel_for_terminal_order},
+        {"matching_engine_restore_open_order_skips_invalid_state", test_matching_engine_restore_open_order_skips_invalid_state},
         {"simulated_execution_engine_rejects_market_order", test_simulated_execution_engine_rejects_market_order},
         {"simulated_execution_engine_partial_then_full_fill", test_simulated_execution_engine_partial_then_full_fill},
         {"simulated_execution_engine_cancel_open_order", test_simulated_execution_engine_cancel_open_order},

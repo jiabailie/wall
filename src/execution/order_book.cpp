@@ -1,9 +1,16 @@
 #include "execution/order_book.hpp"
 
+#include <cmath>
 #include <numeric>
 #include <utility>
 
 namespace trading::execution {
+
+namespace {
+
+constexpr double kQuantityTolerance = 1e-9;
+
+}  // namespace
 
 bool OrderBook::add_order(const trading::core::OrderRequest& request,
                           const std::string& order_id,
@@ -18,7 +25,7 @@ bool OrderBook::add_order(const trading::core::OrderRequest& request,
         .order_id = order_id,
         .client_order_id = client_order_id,
         .request = request,
-        .remaining_quantity = remaining_quantity,
+        .remaining_quantity = std::max(0.0, remaining_quantity),
         .sequence_number = next_sequence_number_++,
     };
 
@@ -154,7 +161,7 @@ std::optional<RestingOrder> OrderBook::best_ask_order() const {
 }
 
 bool OrderBook::apply_fill(const std::string& order_id, const double executed_quantity) {
-    if (executed_quantity <= 0.0) {
+    if (executed_quantity <= kQuantityTolerance) {
         return false;
     }
 
@@ -174,12 +181,13 @@ bool OrderBook::apply_fill(const std::string& order_id, const double executed_qu
             if (order_iterator->order_id != order_id) {
                 continue;
             }
-            if (executed_quantity > order_iterator->remaining_quantity) {
+            if (executed_quantity > (order_iterator->remaining_quantity + kQuantityTolerance)) {
                 return false;
             }
 
-            order_iterator->remaining_quantity -= executed_quantity;
-            if (order_iterator->remaining_quantity == 0.0) {
+            order_iterator->remaining_quantity = std::max(0.0, order_iterator->remaining_quantity - executed_quantity);
+            if (order_iterator->remaining_quantity <= kQuantityTolerance) {
+                order_iterator->remaining_quantity = 0.0;
                 orders.erase(order_iterator);
                 order_index_.erase(locator_iterator);
                 --order_count_;
@@ -215,7 +223,7 @@ bool OrderBook::is_request_compatible(const trading::core::OrderRequest& request
     if (!request.price.has_value() || *request.price <= 0.0) {
         return false;
     }
-    if (request.quantity <= 0.0 || filled_quantity < 0.0 || filled_quantity >= request.quantity) {
+    if (request.quantity <= 0.0 || filled_quantity < 0.0 || filled_quantity >= (request.quantity - kQuantityTolerance)) {
         return false;
     }
     if (order_index_.contains(order_id)) {
