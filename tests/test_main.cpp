@@ -2474,6 +2474,14 @@ void test_kafka_transaction_producer_serializes_payload() {
     expect_true(payload.find("price=42000") != std::string::npos, "payload should contain price");
 }
 
+// Verifies producer key serialization uses transaction_id|yyyyMMddHHmmSS.
+void test_kafka_transaction_producer_serializes_key() {
+    const auto command = make_transaction("tx-serializer", 0);
+    const auto key = trading::infrastructure::serialize_transaction_command_key(command, std::int64_t {1713254950000});
+
+    expect_equal(key, std::string("tx-serializer|20240416080910"), "key should concatenate transaction id, separator, and UTC timestamp");
+}
+
 // Verifies the transaction publisher can parse one flat JSON input line.
 void test_transaction_publisher_parses_json_line() {
     const auto command = trading::app::parse_json_transaction_command_line(
@@ -2828,6 +2836,7 @@ int main() {
         {"kafka_transaction_consumer_skips_malformed_payload_burst", test_kafka_transaction_consumer_skips_malformed_payload_burst},
         {"kafka_transaction_consumer_commit_checkpoint_behavior", test_kafka_transaction_consumer_commit_checkpoint_behavior},
         {"kafka_transaction_producer_serializes_payload", test_kafka_transaction_producer_serializes_payload},
+        {"kafka_transaction_producer_serializes_key", test_kafka_transaction_producer_serializes_key},
         {"transaction_publisher_parses_json_line", test_transaction_publisher_parses_json_line},
         {"transaction_publisher_rejects_invalid_json_line", test_transaction_publisher_rejects_invalid_json_line},
         {"transaction_ingestor_order_and_commit", test_transaction_ingestor_order_and_commit},

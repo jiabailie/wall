@@ -377,6 +377,7 @@ The producer application:
 - reads line-delimited JSON transaction requests
 - parses them into `TransactionCommand` values
 - serializes them into the key-value payload schema consumed by the Kafka ingestion path
+- publishes a Kafka message key as `transaction_id + yyyyMMddHHmmSS` in UTC
 - publishes them into the configured Kafka topic using `librdkafka`
 
 The existing shell helper is still available for container-driven manual publishing:
@@ -526,7 +527,7 @@ After publishing, you can verify the messages in Redpanda Console:
 
 - open `http://localhost:8080`
 - navigate to the `trading-transactions` topic
-- inspect the latest records and offsets
+- inspect the latest records, offsets, and message keys
 
 The shell helper script:
 
