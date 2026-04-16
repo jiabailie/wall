@@ -1805,6 +1805,19 @@ void test_simulation_runtime_happy_path() {
             .auto_complete_partial_fills = false,
         });
 
+    runtime.restore_open_order({
+        .order_id = "resting-sell-1",
+        .client_order_id = "resting-client-1",
+        .strategy_id = "maker-1",
+        .instrument_id = "binance:BTCUSDT",
+        .side = trading::core::OrderSide::sell,
+        .order_type = trading::core::OrderType::limit,
+        .status = trading::core::OrderStatus::acknowledged,
+        .quantity = 0.05,
+        .price = 41990.0,
+        .filled_quantity = 0.0,
+    });
+
     runtime.on_event(trading::core::MarketEvent {
         .event_id = "event-1",
         .type = trading::core::MarketEventType::trade,
@@ -1865,8 +1878,8 @@ void test_simulation_runtime_risk_rejection_stops_execution() {
     expect_true(!position.has_value(), "risk-reject path should not open a position");
 }
 
-// Verifies partial then completion fills are both applied into portfolio through the pipeline.
-void test_simulation_runtime_applies_partial_and_completion_fills() {
+// Verifies partial matching applies the executed quantity and leaves the residual resting.
+void test_simulation_runtime_applies_partial_match_fill() {
     trading::core::FixedClock clock(5000);
     trading::app::SimulationRuntime runtime(
         clock,
@@ -1892,6 +1905,19 @@ void test_simulation_runtime_applies_partial_and_completion_fills() {
             .auto_complete_partial_fills = true,
         });
 
+    runtime.restore_open_order({
+        .order_id = "resting-sell-1",
+        .client_order_id = "resting-client-1",
+        .strategy_id = "maker-1",
+        .instrument_id = "binance:BTCUSDT",
+        .side = trading::core::OrderSide::sell,
+        .order_type = trading::core::OrderType::limit,
+        .status = trading::core::OrderStatus::acknowledged,
+        .quantity = 0.4,
+        .price = 41990.0,
+        .filled_quantity = 0.0,
+    });
+
     runtime.on_event(trading::core::MarketEvent {
         .event_id = "event-1",
         .type = trading::core::MarketEventType::trade,
@@ -1901,11 +1927,11 @@ void test_simulation_runtime_applies_partial_and_completion_fills() {
         .process_timestamp = 4900,
     });
 
-    expect_equal(runtime.risk_approved_count(), std::size_t {1}, "partial/completion path should approve one request");
-    expect_equal(runtime.applied_fill_count(), std::size_t {2}, "partial/completion path should apply two fills");
+    expect_equal(runtime.risk_approved_count(), std::size_t {1}, "partial-match path should approve one request");
+    expect_equal(runtime.applied_fill_count(), std::size_t {1}, "partial-match path should apply one fill");
     const auto position = runtime.portfolio().get_position("binance:BTCUSDT");
     expect_true(position.has_value(), "position should exist");
-    expect_equal(position->net_quantity, 1.0, "partial and completion fills should produce full target quantity");
+    expect_equal(position->net_quantity, 0.4, "partial match should apply only the available opposing quantity");
 }
 
 // Verifies pause trading blocks strategy-generated orders and records operational metrics.
@@ -1987,6 +2013,19 @@ void test_simulation_runtime_records_metrics() {
         },
         &controls,
         &metrics);
+
+    runtime.restore_open_order({
+        .order_id = "resting-sell-1",
+        .client_order_id = "resting-client-1",
+        .strategy_id = "maker-1",
+        .instrument_id = "binance:BTCUSDT",
+        .side = trading::core::OrderSide::sell,
+        .order_type = trading::core::OrderType::limit,
+        .status = trading::core::OrderStatus::acknowledged,
+        .quantity = 0.05,
+        .price = 41990.0,
+        .filled_quantity = 0.0,
+    });
 
     runtime.on_event(trading::core::MarketEvent {
         .event_id = "market-1",
@@ -2480,6 +2519,18 @@ void test_replay_service_reproduces_fixed_session_state() {
             },
             .auto_complete_partial_fills = false,
         });
+    direct_runtime.restore_open_order({
+        .order_id = "resting-sell-1",
+        .client_order_id = "resting-client-1",
+        .strategy_id = "maker-1",
+        .instrument_id = "binance:BTCUSDT",
+        .side = trading::core::OrderSide::sell,
+        .order_type = trading::core::OrderType::limit,
+        .status = trading::core::OrderStatus::acknowledged,
+        .quantity = 0.05,
+        .price = 41990.0,
+        .filled_quantity = 0.0,
+    });
     for (const auto& event : events) {
         direct_runtime.on_event(event);
     }
@@ -2508,6 +2559,18 @@ void test_replay_service_reproduces_fixed_session_state() {
             },
             .auto_complete_partial_fills = false,
         });
+    replay_runtime.restore_open_order({
+        .order_id = "resting-sell-1",
+        .client_order_id = "resting-client-1",
+        .strategy_id = "maker-1",
+        .instrument_id = "binance:BTCUSDT",
+        .side = trading::core::OrderSide::sell,
+        .order_type = trading::core::OrderType::limit,
+        .status = trading::core::OrderStatus::acknowledged,
+        .quantity = 0.05,
+        .price = 41990.0,
+        .filled_quantity = 0.0,
+    });
 
     const auto stats = replay_service.replay([&replay_runtime](const trading::core::EngineEvent& event) {
         replay_runtime.on_event(event);
@@ -2594,12 +2657,36 @@ void test_replay_service_isolated_from_live_clock() {
 
     trading::core::FixedClock clock_a(0);
     trading::app::SimulationRuntime runtime_a(clock_a, risk_config, runtime_config);
+    runtime_a.restore_open_order({
+        .order_id = "resting-sell-1",
+        .client_order_id = "resting-client-1",
+        .strategy_id = "maker-1",
+        .instrument_id = "binance:BTCUSDT",
+        .side = trading::core::OrderSide::sell,
+        .order_type = trading::core::OrderType::limit,
+        .status = trading::core::OrderStatus::acknowledged,
+        .quantity = 0.05,
+        .price = 41990.0,
+        .filled_quantity = 0.0,
+    });
     const auto stats_a = replay_service.replay([&runtime_a](const trading::core::EngineEvent& event) {
         runtime_a.on_event(event);
     });
 
     trading::core::FixedClock clock_b(9999999);
     trading::app::SimulationRuntime runtime_b(clock_b, risk_config, runtime_config);
+    runtime_b.restore_open_order({
+        .order_id = "resting-sell-1",
+        .client_order_id = "resting-client-1",
+        .strategy_id = "maker-1",
+        .instrument_id = "binance:BTCUSDT",
+        .side = trading::core::OrderSide::sell,
+        .order_type = trading::core::OrderType::limit,
+        .status = trading::core::OrderStatus::acknowledged,
+        .quantity = 0.05,
+        .price = 41990.0,
+        .filled_quantity = 0.0,
+    });
     const auto stats_b = replay_service.replay([&runtime_b](const trading::core::EngineEvent& event) {
         runtime_b.on_event(event);
     });
@@ -2668,6 +2755,18 @@ void test_backtest_runner_summarizes_runtime_results() {
             },
             .auto_complete_partial_fills = false,
         });
+    runtime.restore_open_order({
+        .order_id = "resting-sell-1",
+        .client_order_id = "resting-client-1",
+        .strategy_id = "maker-1",
+        .instrument_id = "binance:BTCUSDT",
+        .side = trading::core::OrderSide::sell,
+        .order_type = trading::core::OrderType::limit,
+        .status = trading::core::OrderStatus::acknowledged,
+        .quantity = 0.05,
+        .price = 41990.0,
+        .filled_quantity = 0.0,
+    });
 
     trading::app::BacktestRunner runner(log_path);
     const auto summary = runner.run(runtime);
@@ -3164,7 +3263,7 @@ int main() {
         {"portfolio_service_fee_handling_on_balances", test_portfolio_service_fee_handling_on_balances},
         {"simulation_runtime_happy_path", test_simulation_runtime_happy_path},
         {"simulation_runtime_risk_rejection_stops_execution", test_simulation_runtime_risk_rejection_stops_execution},
-        {"simulation_runtime_applies_partial_and_completion_fills", test_simulation_runtime_applies_partial_and_completion_fills},
+        {"simulation_runtime_applies_partial_match_fill", test_simulation_runtime_applies_partial_match_fill},
         {"simulation_runtime_pause_trading_blocks_orders", test_simulation_runtime_pause_trading_blocks_orders},
         {"simulation_runtime_records_metrics", test_simulation_runtime_records_metrics},
         {"in_memory_order_repository_save_and_update", test_in_memory_order_repository_save_and_update},

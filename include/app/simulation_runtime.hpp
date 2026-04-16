@@ -3,6 +3,7 @@
 #include "app/runtime_operational_controls.hpp"
 #include "config/app_config.hpp"
 #include "core/types.hpp"
+#include "execution/matching_engine.hpp"
 #include "execution/simulated_execution_engine.hpp"
 #include "market_data/market_state_store.hpp"
 #include "monitoring/metrics.hpp"
@@ -64,7 +65,7 @@ public:
         return strategy_coordinator_ != nullptr ? strategy_coordinator_->strategy_count() : 0;
     }
 
-    // Restores one persisted open order into the execution engine for startup recovery.
+    // Restores one persisted open order into the local matching engine for startup recovery.
     void restore_open_order(const trading::storage::OrderRecord& order);
 
     // Restores one persisted position into the portfolio service for startup recovery.
@@ -89,7 +90,7 @@ private:
     trading::strategy::StrategyContext strategy_context_;
     trading::risk::RiskEngine risk_engine_;
     trading::portfolio::PortfolioService portfolio_service_;
-    trading::execution::SimulatedExecutionEngine execution_engine_;
+    trading::execution::MatchingEngine execution_engine_;
     RuntimeOperationalControls* controls_ {nullptr};
     trading::monitoring::IMetricsCollector* metrics_ {nullptr};
     bool auto_complete_partial_fills_ {false};

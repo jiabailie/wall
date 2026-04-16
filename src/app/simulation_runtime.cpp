@@ -1,6 +1,5 @@
 #include "app/simulation_runtime.hpp"
 
-#include <algorithm>
 #include <memory>
 #include <variant>
 
@@ -19,10 +18,11 @@ SimulationRuntime::SimulationRuntime(const trading::core::IClock& clock,
           .clock = clock,
       }),
       risk_engine_(risk_config, market_state_store_, clock),
-      execution_engine_(runtime_config.execution),
       controls_(controls),
       metrics_(metrics),
       auto_complete_partial_fills_(runtime_config.auto_complete_partial_fills) {
+    static_cast<void>(runtime_config.execution);
+    static_cast<void>(auto_complete_partial_fills_);
     if (strategy_coordinator_ == nullptr) {
         strategy_coordinator_ = std::make_shared<trading::strategy::StrategyCoordinator>();
         strategy_coordinator_->add_strategy(
@@ -67,16 +67,6 @@ void SimulationRuntime::on_event(const trading::core::EngineEvent& event) {
         }
         const auto result = execution_engine_.submit(request);
         handle_execution_result(result);
-
-        const auto has_partial_update = std::any_of(
-            result.updates.begin(),
-            result.updates.end(),
-            [](const trading::core::OrderUpdate& update) {
-                return update.status == trading::core::OrderStatus::partially_filled;
-            });
-        if (auto_complete_partial_fills_ && has_partial_update) {
-            handle_execution_result(execution_engine_.complete_open_order(result.order_id));
-        }
 
         if (metrics_ != nullptr) {
             metrics_->observe_latency("order_processing_latency_ms", clock_.now_ms() - request_started_ms);
