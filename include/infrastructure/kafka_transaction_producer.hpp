@@ -3,6 +3,7 @@
 #include "config/app_config.hpp"
 #include "core/types.hpp"
 
+#include <cstdint>
 #include <string>
 
 namespace trading::infrastructure {
