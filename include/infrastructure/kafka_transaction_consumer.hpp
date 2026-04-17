@@ -3,6 +3,7 @@
 #include "config/app_config.hpp"
 #include "ingestion/transaction_consumer.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>

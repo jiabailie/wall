@@ -8,21 +8,32 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(HIREDIS REQUIRED IMPORTED_TARGET hiredis)
 pkg_check_modules(RDKAFKA REQUIRED IMPORTED_TARGET rdkafka)
-find_path(LIBPQ_INCLUDE_DIR
-    NAMES libpq-fe.h
-    PATHS
-        /opt/homebrew/opt/libpq/include
-        /usr/local/opt/libpq/include
-)
-find_library(LIBPQ_LIBRARY
-    NAMES pq libpq
-    PATHS
-        /opt/homebrew/opt/libpq/lib
-        /usr/local/opt/libpq/lib
-)
+find_package(PostgreSQL QUIET)
 
-if(NOT LIBPQ_INCLUDE_DIR OR NOT LIBPQ_LIBRARY)
-    message(FATAL_ERROR "libpq headers or library were not found")
+if(PostgreSQL_FOUND)
+    set(LIBPQ_INCLUDE_DIRS ${PostgreSQL_INCLUDE_DIRS})
+    set(LIBPQ_LINK_TARGET PostgreSQL::PostgreSQL)
+else()
+    find_path(LIBPQ_INCLUDE_DIR
+        NAMES libpq-fe.h
+        PATH_SUFFIXES postgresql
+        PATHS
+            /opt/homebrew/opt/libpq/include
+            /usr/local/opt/libpq/include
+    )
+    find_library(LIBPQ_LIBRARY
+        NAMES pq libpq
+        PATHS
+            /opt/homebrew/opt/libpq/lib
+            /usr/local/opt/libpq/lib
+    )
+
+    if(NOT LIBPQ_INCLUDE_DIR OR NOT LIBPQ_LIBRARY)
+        message(FATAL_ERROR "libpq headers or library were not found")
+    endif()
+
+    set(LIBPQ_INCLUDE_DIRS ${LIBPQ_INCLUDE_DIR})
+    set(LIBPQ_LINK_TARGET ${LIBPQ_LIBRARY})
 endif()
 
 add_library(trading_engine
@@ -66,7 +77,7 @@ target_include_directories(trading_engine
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-        ${LIBPQ_INCLUDE_DIR}
+        ${LIBPQ_INCLUDE_DIRS}
 )
 
 target_compile_definitions(trading_engine
@@ -76,7 +87,7 @@ target_compile_definitions(trading_engine
 
 target_link_libraries(trading_engine
     PRIVATE
-        ${LIBPQ_LIBRARY}
+        ${LIBPQ_LINK_TARGET}
         PkgConfig::HIREDIS
         PkgConfig::RDKAFKA
 )
