@@ -3162,10 +3162,11 @@ void test_replay_service_reproduces_fixed_session_state() {
     const std::vector<trading::core::EngineEvent> events {
         trading::core::MarketEvent {
             .event_id = "event-1",
-            .type = trading::core::MarketEventType::trade,
+            .type = trading::core::MarketEventType::book_snapshot,
             .instrument = make_btc_instrument(),
-            .price = 41990.0,
-            .quantity = 0.5,
+            .bid_levels = {
+                {.price = 41990.0, .quantity = 0.05},
+            },
             .process_timestamp = 4900,
         },
         trading::core::TimerEvent {
@@ -3205,7 +3206,7 @@ void test_replay_service_reproduces_fixed_session_state() {
             },
             .auto_complete_partial_fills = false,
         });
-    log_test_step("seed direct runtime with resting liquidity");
+    log_test_step("seed direct runtime with matching resting liquidity");
     direct_runtime.restore_open_order({
         .order_id = "resting-sell-1",
         .client_order_id = "resting-client-1",
@@ -3269,6 +3270,7 @@ void test_replay_service_reproduces_fixed_session_state() {
     expect_equal(stats.replayed_records, std::size_t {2}, "replay should apply both records");
     expect_equal(replay_runtime.risk_approved_count(), direct_runtime.risk_approved_count(), "replay should match approved count");
     expect_equal(replay_runtime.applied_fill_count(), direct_runtime.applied_fill_count(), "replay should match fill count");
+    expect_equal(replay_runtime.applied_fill_count(), std::size_t {1}, "book-driven replay should apply one fill");
 
     const auto direct_position = direct_runtime.portfolio().get_position("binance:BTCUSDT");
     const auto replay_position = replay_runtime.portfolio().get_position("binance:BTCUSDT");

@@ -37,6 +37,43 @@ std::optional<double> decode_optional_double(const std::string& value) {
     return std::stod(value);
 }
 
+// Encodes one side of book levels as price:quantity pairs separated by commas.
+std::string encode_book_levels(const std::vector<trading::core::BookLevel>& levels) {
+    std::stringstream stream;
+    for (std::size_t index = 0; index < levels.size(); ++index) {
+        if (index > 0) {
+            stream << ',';
+        }
+        stream << levels[index].price << ':' << levels[index].quantity;
+    }
+
+    return stream.str();
+}
+
+// Parses one comma-delimited list of price:quantity pairs into book levels.
+std::optional<std::vector<trading::core::BookLevel>> decode_book_levels(const std::string& value) {
+    if (value.empty()) {
+        return std::vector<trading::core::BookLevel> {};
+    }
+
+    std::vector<trading::core::BookLevel> levels;
+    std::stringstream stream(value);
+    std::string level;
+    while (std::getline(stream, level, ',')) {
+        const auto separator = level.find(':');
+        if (separator == std::string::npos) {
+            return std::nullopt;
+        }
+
+        levels.push_back({
+            .price = std::stod(level.substr(0, separator)),
+            .quantity = std::stod(level.substr(separator + 1)),
+        });
+    }
+
+    return levels;
+}
+
 }  // namespace
 
 ReplayService::ReplayService(std::filesystem::path log_path) : log_path_(std::move(log_path)) {}
@@ -100,6 +137,8 @@ std::string ReplayService::serialize_event(const trading::core::EngineEvent& eve
                 << concrete_event.quantity << '\t'
                 << encode_optional_double(concrete_event.bid_price) << '\t'
                 << encode_optional_double(concrete_event.ask_price) << '\t'
+                << encode_book_levels(concrete_event.bid_levels) << '\t'
+                << encode_book_levels(concrete_event.ask_levels) << '\t'
                 << concrete_event.exchange_timestamp << '\t'
                 << concrete_event.receive_timestamp << '\t'
                 << concrete_event.process_timestamp;
@@ -139,7 +178,17 @@ std::optional<trading::core::EngineEvent> ReplayService::deserialize_event(const
 
     try {
         if (fields[0] == "market") {
-            if (fields.size() != 17) {
+            if (fields.size() != 17 && fields.size() != 19) {
+                return std::nullopt;
+            }
+
+            const auto bid_levels = fields.size() == 19
+                ? decode_book_levels(fields[14])
+                : std::optional<std::vector<trading::core::BookLevel>>(std::vector<trading::core::BookLevel> {});
+            const auto ask_levels = fields.size() == 19
+                ? decode_book_levels(fields[15])
+                : std::optional<std::vector<trading::core::BookLevel>>(std::vector<trading::core::BookLevel> {});
+            if (!bid_levels.has_value() || !ask_levels.has_value()) {
                 return std::nullopt;
             }
 
@@ -159,9 +208,11 @@ std::optional<trading::core::EngineEvent> ReplayService::deserialize_event(const
                 .quantity = std::stod(fields[11]),
                 .bid_price = decode_optional_double(fields[12]),
                 .ask_price = decode_optional_double(fields[13]),
-                .exchange_timestamp = std::stoll(fields[14]),
-                .receive_timestamp = std::stoll(fields[15]),
-                .process_timestamp = std::stoll(fields[16]),
+                .bid_levels = *bid_levels,
+                .ask_levels = *ask_levels,
+                .exchange_timestamp = std::stoll(fields[fields.size() == 19 ? 16 : 14]),
+                .receive_timestamp = std::stoll(fields[fields.size() == 19 ? 17 : 15]),
+                .process_timestamp = std::stoll(fields[fields.size() == 19 ? 18 : 16]),
             };
         }
 
