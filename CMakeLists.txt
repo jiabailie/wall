@@ -17,7 +17,8 @@ endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(WALL_WARNINGS)
-    add_compile_options(-Wall -Wextra -Wpedantic)
+    # Designated initializers intentionally omit defaulted fields; GCC would warn on each one.
+    add_compile_options(-Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
     if(WALL_WERROR)
         add_compile_options(-Werror)
     endif()
