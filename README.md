@@ -44,23 +44,24 @@ docker compose -f wall/docker-compose.yml down
 
 Files:
 
-- [main.cpp](/Users/yangruiguo/Documents/wall/main.cpp)
-- [application.cpp](/Users/yangruiguo/Documents/wall/src/app/application.cpp)
+- [main.cpp](main.cpp)
+- [application.cpp](src/app/application.cpp)
 
 Responsibility:
 
 - starts the program
 - loads configuration
 - validates startup settings
-- prints a minimal startup banner for the current scaffold
+- connects to Redis, PostgreSQL, and Kafka (or falls back to local adapters when allowed)
+- runs a single mock-driven simulation cycle and logs the result
 
 ### Core
 
 Files:
 
-- [types.hpp](/Users/yangruiguo/Documents/wall/include/core/types.hpp)
-- [clock.hpp](/Users/yangruiguo/Documents/wall/include/core/clock.hpp)
-- [event_dispatcher.hpp](/Users/yangruiguo/Documents/wall/include/core/event_dispatcher.hpp)
+- [types.hpp](include/core/types.hpp)
+- [clock.hpp](include/core/clock.hpp)
+- [event_dispatcher.hpp](include/core/event_dispatcher.hpp)
 
 Responsibility:
 
@@ -72,10 +73,10 @@ Responsibility:
 
 Files:
 
-- [app_config.hpp](/Users/yangruiguo/Documents/wall/include/config/app_config.hpp)
-- [config_loader.hpp](/Users/yangruiguo/Documents/wall/include/config/config_loader.hpp)
-- [config_loader.cpp](/Users/yangruiguo/Documents/wall/src/config/config_loader.cpp)
-- [development.cfg](/Users/yangruiguo/Documents/wall/configs/development.cfg)
+- [app_config.hpp](include/config/app_config.hpp)
+- [config_loader.hpp](include/config/config_loader.hpp)
+- [config_loader.cpp](src/config/config_loader.cpp)
+- [development.cfg](configs/development.cfg)
 
 Responsibility:
 
@@ -87,8 +88,8 @@ Responsibility:
 
 Files:
 
-- [market_state_store.hpp](/Users/yangruiguo/Documents/wall/include/market_data/market_state_store.hpp)
-- [market_state_store.cpp](/Users/yangruiguo/Documents/wall/src/market_data/market_state_store.cpp)
+- [market_state_store.hpp](include/market_data/market_state_store.hpp)
+- [market_state_store.cpp](src/market_data/market_state_store.cpp)
 
 Responsibility:
 
@@ -100,10 +101,10 @@ Responsibility:
 
 Files:
 
-- [transaction_consumer.hpp](/Users/yangruiguo/Documents/wall/include/ingestion/transaction_consumer.hpp)
-- [transaction_ingestor.hpp](/Users/yangruiguo/Documents/wall/include/ingestion/transaction_ingestor.hpp)
-- [transaction_consumer.cpp](/Users/yangruiguo/Documents/wall/src/ingestion/transaction_consumer.cpp)
-- [transaction_ingestor.cpp](/Users/yangruiguo/Documents/wall/src/ingestion/transaction_ingestor.cpp)
+- [transaction_consumer.hpp](include/ingestion/transaction_consumer.hpp)
+- [transaction_ingestor.hpp](include/ingestion/transaction_ingestor.hpp)
+- [transaction_consumer.cpp](src/ingestion/transaction_consumer.cpp)
+- [transaction_ingestor.cpp](src/ingestion/transaction_ingestor.cpp)
 
 Responsibility:
 
@@ -118,8 +119,8 @@ Responsibility:
 
 Files:
 
-- [storage_interfaces.hpp](/Users/yangruiguo/Documents/wall/include/storage/storage_interfaces.hpp)
-- [storage_interfaces.cpp](/Users/yangruiguo/Documents/wall/src/storage/storage_interfaces.cpp)
+- [storage_interfaces.hpp](include/storage/storage_interfaces.hpp)
+- [storage_interfaces.cpp](src/storage/storage_interfaces.cpp)
 
 Responsibility:
 
@@ -132,7 +133,7 @@ Responsibility:
 
 Files:
 
-- [docker-compose.yml](/Users/yangruiguo/Documents/wall/docker/docker-compose.yml)
+- [docker-compose.yml](wall/docker-compose.yml)
 
 Responsibility:
 
@@ -201,6 +202,7 @@ You need:
 
 - CMake 3.20 or later
 - a C++20 compiler
+- hiredis, librdkafka, libpq, and GoogleTest (`brew install hiredis librdkafka libpq googletest`)
 - Docker
 - Docker Compose support
 
@@ -221,13 +223,13 @@ The project uses these Docker components:
 From the project root, start all containers:
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d
+docker compose -f wall/docker-compose.yml up -d
 ```
 
 Check container status:
 
 ```bash
-docker compose -f docker/docker-compose.yml ps
+docker compose -f wall/docker-compose.yml ps
 ```
 
 Expected services:
@@ -241,14 +243,14 @@ Expected services:
 To stop the containers later:
 
 ```bash
-docker compose -f docker/docker-compose.yml down
+docker compose -f wall/docker-compose.yml down
 ```
 
 ### Step 2: Review Local Configuration
 
 The default runtime config is:
 
-- [development.cfg](/Users/yangruiguo/Documents/wall/configs/development.cfg)
+- [development.cfg](configs/development.cfg)
 
 It contains:
 
@@ -257,11 +259,7 @@ It contains:
 - Kafka broker list, topic, and consumer group
 - exchange name and instrument list
 
-Optional environment overrides:
-
-- `TRADING_MODE`
-- `TRADING_POSTGRES_PASSWORD`
-- `TRADING_KAFKA_TOPIC`
+Environment overrides (`TRADING_<KEY>`) are described in the Configuration section below.
 
 Example:
 
@@ -358,7 +356,7 @@ This does not replace Kafka in the stack. It is only a UI connected to the exist
 
 Sample transaction fixtures are stored in:
 
-- [sample_transactions.jsonl](/Users/yangruiguo/Documents/wall/configs/sample_transactions.jsonl)
+- [sample_transactions.jsonl](configs/sample_transactions.jsonl)
 
 Publish the default sample data into Kafka with the C++ producer application:
 
@@ -396,7 +394,7 @@ From the project root:
 
 Expected behavior in the current scaffold:
 
-- the program loads [development.cfg](/Users/yangruiguo/Documents/wall/configs/development.cfg)
+- the program loads [development.cfg](configs/development.cfg)
 - validates Redis, PostgreSQL, and Kafka configuration
 - runs a single mock-driven simulation cycle
 - logs processed market, transaction, and timer events
@@ -407,7 +405,7 @@ The current engine executable is still a development-oriented bootstrap, not a l
 Startup infrastructure behavior:
 
 - when PostgreSQL, Redis, and Kafka are reachable, `wall` uses the native adapters
-- when native infrastructure initialization fails, `wall` falls back to:
+- when native infrastructure initialization fails and `infrastructure.allow_fallback=true` (set in `development.cfg`), `wall` falls back to:
   - file-backed local repositories
   - in-memory cache adapters
   - mock-driven startup processing without Kafka resume
@@ -419,12 +417,14 @@ In fallback mode, startup logs include:
 
 This lets local development continue even when Docker services are not running.
 
+When `infrastructure.allow_fallback` is `false` or absent, a native infrastructure failure is logged as `infrastructure_unavailable` and `wall` exits with an error instead of falling back. Keep it `false` outside local development.
+
 ### Step 9: Shut Everything Down
 
 When you are done:
 
 ```bash
-docker compose -f docker/docker-compose.yml down
+docker compose -f wall/docker-compose.yml down
 ```
 
 ## Docker Components Summary
@@ -489,7 +489,7 @@ Current status:
 
 Sample transaction fixtures are stored in:
 
-- [sample_transactions.jsonl](/Users/yangruiguo/Documents/wall/configs/sample_transactions.jsonl)
+- [sample_transactions.jsonl](configs/sample_transactions.jsonl)
 
 A C++ producer executable is available after building the project:
 
@@ -497,7 +497,7 @@ A C++ producer executable is available after building the project:
 
 A shell helper is also available at:
 
-- [send_sample_transactions.sh](/Users/yangruiguo/Documents/wall/scripts/send_sample_transactions.sh)
+- [send_sample_transactions.sh](scripts/send_sample_transactions.sh)
 
 Before using it, start the Docker infrastructure:
 
@@ -538,13 +538,47 @@ The shell helper script:
 
 The default config file is:
 
-- [development.cfg](/Users/yangruiguo/Documents/wall/configs/development.cfg)
+- [development.cfg](configs/development.cfg)
 
-Supported environment overrides currently include:
+Config keys (`key=value`, `#` for comments):
 
-- `TRADING_MODE`
-- `TRADING_POSTGRES_PASSWORD`
-- `TRADING_KAFKA_TOPIC`
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `mode` | string | required | e.g. `paper` |
+| `exchange.name` | string | - | |
+| `instruments` | csv | - | first entry drives the mock instrument |
+| `infrastructure.allow_fallback` | bool | `false` | allow local file/in-memory fallback |
+| `redis.host`, `redis.port` | string, int | -, `6379` | |
+| `postgres.host`, `postgres.port` | string, int | -, `5432` | |
+| `postgres.database`, `postgres.user`, `postgres.password` | string | - | |
+| `kafka.brokers` | csv | - | |
+| `kafka.transaction_topic`, `kafka.consumer_group` | string | - | |
+| `risk.max_order_quantity`, `risk.max_order_notional`, `risk.max_position_quantity` | double | `0.0` | |
+| `risk.stale_after_ms` | int | `0` | |
+| `risk.kill_switch_enabled` | bool | `false` | |
+| `strategy.id`, `strategy.trigger_instrument_id`, `strategy.side` | string | - | |
+| `strategy.trigger_price`, `strategy.order_quantity` | double | `0.0` | |
+| `simulation.partial_fill_threshold`, `simulation.partial_fill_ratio` | double | `0.0` | |
+| `simulation.auto_complete_partial_fills` | bool | `false` | |
+
+Booleans accept `1`, `true`, `TRUE`, `yes`, `on`.
+
+Any key above can be overridden with `TRADING_<KEY>`, upper-cased with dots replaced by underscores (for example `TRADING_REDIS_HOST`, `TRADING_POSTGRES_PORT`, `TRADING_INFRASTRUCTURE_ALLOW_FALLBACK`). The older names `TRADING_KAFKA_TOPIC` and `TRADING_KILL_SWITCH_ENABLED` still work.
+
+Malformed numeric values fail at load time with the offending key name. Pass `--config <path>` to `./build/wall` to use a config file other than `configs/development.cfg`.
+
+Transaction input (`configs/sample_transactions.jsonl`) is one JSON object per line with `transaction_id`, `user_id`, `account_id`, `command_type` (`place_order` or `cancel_order`), `instrument_symbol`, `quantity`, and `price`.
+
+The unit tests (GoogleTest, one CTest case per test, sources in `tests/`) use file-backed and in-memory fakes, so `ctest` does not need Docker. Run one with `ctest --test-dir build -R Config` or `./build/wall_tests --gtest_filter='Risk.*'`.
+
+Integration tests (`Integration.*`) exercise the real PostgreSQL and Redis adapters. They skip unless `WALL_INTEGRATION=1` and the Docker stack is up:
+
+```bash
+docker compose -f wall/docker-compose.yml up -d
+WALL_INTEGRATION=1 ctest --test-dir build -R '^Integration\.' --output-on-failure
+```
+
+Build presets: `cmake --preset sanitize && cmake --build --preset sanitize && ctest --preset sanitize` runs the suite under ASan and UBSan.
 
 Example:
 

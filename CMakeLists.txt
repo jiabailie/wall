@@ -5,6 +5,29 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(WALL_WARNINGS "Enable extra compiler warnings" ON)
+option(WALL_WERROR "Treat compiler warnings as errors" OFF)
+option(WALL_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
+# Default to an optimized build with debug info so benchmarks are meaningful.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(WALL_WARNINGS)
+    add_compile_options(-Wall -Wextra -Wpedantic)
+    if(WALL_WERROR)
+        add_compile_options(-Werror)
+    endif()
+endif()
+
+if(WALL_SANITIZERS)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(HIREDIS REQUIRED IMPORTED_TARGET hiredis)
 pkg_check_modules(RDKAFKA REQUIRED IMPORTED_TARGET rdkafka)
@@ -73,6 +96,10 @@ add_library(trading_engine
     src/strategy/strategy_coordinator.cpp
 )
 
+# librdkafka's RD_KAFKA_V_* macros use GNU statement expressions.
+set_source_files_properties(src/infrastructure/kafka_transaction_producer.cpp
+    PROPERTIES COMPILE_OPTIONS "-Wno-gnu-statement-expression-from-macro-expansion")
+
 target_include_directories(trading_engine
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -95,8 +122,11 @@ target_link_libraries(trading_engine
 add_executable(wall main.cpp)
 target_link_libraries(wall PRIVATE trading_engine)
 
-add_executable(wall_tests tests/test_main.cpp)
-target_link_libraries(wall_tests PRIVATE trading_engine)
+find_package(GTest REQUIRED)
+file(GLOB WALL_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
+add_executable(wall_tests ${WALL_TEST_SOURCES})
+target_include_directories(wall_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(wall_tests PRIVATE trading_engine GTest::gtest)
 
 add_executable(wall_replay src/tools/replay_main.cpp)
 target_link_libraries(wall_replay PRIVATE trading_engine)
@@ -111,4 +141,5 @@ add_executable(wall_benchmark src/tools/benchmark_main.cpp)
 target_link_libraries(wall_benchmark PRIVATE trading_engine)
 
 enable_testing()
-add_test(NAME wall_tests COMMAND wall_tests)
+include(GoogleTest)
+gtest_discover_tests(wall_tests DISCOVERY_TIMEOUT 60)

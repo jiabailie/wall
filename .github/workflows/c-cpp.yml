@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ "main" ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ${{ matrix.os }}
@@ -21,13 +25,13 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake pkg-config libhiredis-dev librdkafka-dev libpq-dev
+        sudo apt-get install -y cmake pkg-config libhiredis-dev librdkafka-dev libpq-dev libgtest-dev
 
     - name: Install dependencies (macOS)
       if: runner.os == 'macOS'
       run: |
         brew update
-        brew install cmake pkg-config hiredis librdkafka libpq
+        brew install cmake pkg-config hiredis librdkafka libpq googletest
 
     - name: Configure
       run: cmake -S . -B build
@@ -37,3 +41,23 @@ jobs:
 
     - name: Test
       run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake pkg-config libhiredis-dev librdkafka-dev libpq-dev libgtest-dev
+
+    - name: Configure (ASan + UBSan, warnings as errors)
+      run: cmake --preset sanitize
+
+    - name: Build
+      run: cmake --build --preset sanitize
+
+    - name: Test
+      run: ctest --preset sanitize
