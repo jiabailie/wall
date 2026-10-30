@@ -65,6 +65,8 @@ struct AppConfig {
     RiskConfig risk;
     StrategyConfig strategy;
     SimulationConfig simulation;
+    // Allows falling back to local file/in-memory adapters when native infrastructure is unavailable.
+    bool allow_fallback {false};
 };
 
 // Stores the result of configuration validation.

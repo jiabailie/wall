@@ -1,5 +1,7 @@
 #include "config/config_loader.hpp"
 
+#include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -49,6 +51,87 @@ std::optional<std::string> get_env_value(const char* key) {
     return std::nullopt;
 }
 
+using ValueMap = std::unordered_map<std::string, std::string>;
+
+// Lists every config key that can be overridden by a TRADING_<KEY> environment variable.
+constexpr const char* kKnownKeys[] = {
+    "mode",
+    "exchange.name",
+    "instruments",
+    "infrastructure.allow_fallback",
+    "redis.host",
+    "redis.port",
+    "postgres.host",
+    "postgres.port",
+    "postgres.database",
+    "postgres.user",
+    "postgres.password",
+    "kafka.brokers",
+    "kafka.transaction_topic",
+    "kafka.consumer_group",
+    "risk.max_order_quantity",
+    "risk.max_order_notional",
+    "risk.max_position_quantity",
+    "risk.stale_after_ms",
+    "risk.kill_switch_enabled",
+    "strategy.id",
+    "strategy.trigger_instrument_id",
+    "strategy.trigger_price",
+    "strategy.order_quantity",
+    "strategy.side",
+    "simulation.partial_fill_threshold",
+    "simulation.partial_fill_ratio",
+    "simulation.auto_complete_partial_fills",
+};
+
+// Builds the environment variable name for a config key.
+std::string env_name_for_key(const std::string& key) {
+    std::string name = "TRADING_";
+    for (const char c : key) {
+        name += (c == '.') ? '_' : static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return name;
+}
+
+// Returns the value for a key without inserting missing entries.
+std::string get_string(const ValueMap& values, const std::string& key) {
+    const auto it = values.find(key);
+    return it == values.end() ? std::string() : it->second;
+}
+
+// Parses a numeric value with a key-named error, using the default when the key is empty or absent.
+template <typename T, typename Parser>
+T parse_number(const ValueMap& values, const std::string& key, T default_value, Parser parser) {
+    const auto text = get_string(values, key);
+    if (text.empty()) {
+        return default_value;
+    }
+
+    try {
+        std::size_t consumed = 0;
+        const T result = parser(text, &consumed);
+        if (consumed != text.size()) {
+            throw std::invalid_argument("trailing characters");
+        }
+        return result;
+    } catch (const std::exception&) {
+        throw std::runtime_error("Invalid numeric value for config key '" + key + "': " + text);
+    }
+}
+
+int get_int(const ValueMap& values, const std::string& key, int default_value) {
+    return parse_number<int>(values, key, default_value, [](const std::string& t, std::size_t* n) { return std::stoi(t, n); });
+}
+
+std::int64_t get_int64(const ValueMap& values, const std::string& key, std::int64_t default_value) {
+    return parse_number<std::int64_t>(
+        values, key, default_value, [](const std::string& t, std::size_t* n) { return static_cast<std::int64_t>(std::stoll(t, n)); });
+}
+
+double get_double(const ValueMap& values, const std::string& key, double default_value) {
+    return parse_number<double>(values, key, default_value, [](const std::string& t, std::size_t* n) { return std::stod(t, n); });
+}
+
 // Parses a string boolean using common config spellings.
 bool parse_bool(const std::string& value) {
     return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "on";
@@ -63,7 +146,7 @@ AppConfig ConfigLoader::load_from_file(const std::string& path) const {
         throw std::runtime_error("Unable to open config file: " + path);
     }
 
-    std::unordered_map<std::string, std::string> values;
+    ValueMap values;
     std::string line;
 
     // Step 1: Parse every non-empty, non-comment line into key/value pairs.
@@ -82,17 +165,15 @@ AppConfig ConfigLoader::load_from_file(const std::string& path) const {
     }
 
     // Step 2: Apply environment overrides where present.
-    if (const auto value = get_env_value("TRADING_MODE")) {
-        values["mode"] = *value;
+    // Every known key can be overridden with TRADING_<KEY> (dots become underscores, upper-cased).
+    for (const auto* key : kKnownKeys) {
+        if (const auto value = get_env_value(env_name_for_key(key).c_str())) {
+            values[key] = *value;
+        }
     }
-    if (const auto value = get_env_value("TRADING_POSTGRES_PASSWORD")) {
-        values["postgres.password"] = *value;
-    }
+    // Legacy override names kept for backward compatibility.
     if (const auto value = get_env_value("TRADING_KAFKA_TOPIC")) {
         values["kafka.transaction_topic"] = *value;
-    }
-    if (const auto value = get_env_value("TRADING_STRATEGY_TRIGGER_PRICE")) {
-        values["strategy.trigger_price"] = *value;
     }
     if (const auto value = get_env_value("TRADING_KILL_SWITCH_ENABLED")) {
         values["risk.kill_switch_enabled"] = *value;
@@ -100,34 +181,33 @@ AppConfig ConfigLoader::load_from_file(const std::string& path) const {
 
     // Step 3: Map the parsed values into the typed config structure.
     AppConfig config;
-    config.mode = values["mode"];
-    config.exchange_name = values["exchange.name"];
-    config.instruments = split_csv(values["instruments"]);
-    config.redis.host = values["redis.host"];
-    config.redis.port = values["redis.port"].empty() ? 6379 : std::stoi(values["redis.port"]);
-    config.postgres.host = values["postgres.host"];
-    config.postgres.port = values["postgres.port"].empty() ? 5432 : std::stoi(values["postgres.port"]);
-    config.postgres.database = values["postgres.database"];
-    config.postgres.user = values["postgres.user"];
-    config.postgres.password = values["postgres.password"];
-    config.kafka.brokers = split_csv(values["kafka.brokers"]);
-    config.kafka.transaction_topic = values["kafka.transaction_topic"];
-    config.kafka.consumer_group = values["kafka.consumer_group"];
-    config.risk.max_order_quantity = values["risk.max_order_quantity"].empty() ? 0.0 : std::stod(values["risk.max_order_quantity"]);
-    config.risk.max_order_notional = values["risk.max_order_notional"].empty() ? 0.0 : std::stod(values["risk.max_order_notional"]);
-    config.risk.max_position_quantity = values["risk.max_position_quantity"].empty() ? 0.0 : std::stod(values["risk.max_position_quantity"]);
-    config.risk.stale_after_ms = values["risk.stale_after_ms"].empty() ? 0 : std::stoll(values["risk.stale_after_ms"]);
-    config.risk.kill_switch_enabled = parse_bool(values["risk.kill_switch_enabled"]);
-    config.strategy.strategy_id = values["strategy.id"];
-    config.strategy.trigger_instrument_id = values["strategy.trigger_instrument_id"];
-    config.strategy.trigger_price = values["strategy.trigger_price"].empty() ? 0.0 : std::stod(values["strategy.trigger_price"]);
-    config.strategy.order_quantity = values["strategy.order_quantity"].empty() ? 0.0 : std::stod(values["strategy.order_quantity"]);
-    config.strategy.side = values["strategy.side"];
-    config.simulation.partial_fill_threshold =
-        values["simulation.partial_fill_threshold"].empty() ? 0.0 : std::stod(values["simulation.partial_fill_threshold"]);
-    config.simulation.partial_fill_ratio =
-        values["simulation.partial_fill_ratio"].empty() ? 0.0 : std::stod(values["simulation.partial_fill_ratio"]);
-    config.simulation.auto_complete_partial_fills = parse_bool(values["simulation.auto_complete_partial_fills"]);
+    config.mode = get_string(values, "mode");
+    config.exchange_name = get_string(values, "exchange.name");
+    config.instruments = split_csv(get_string(values, "instruments"));
+    config.redis.host = get_string(values, "redis.host");
+    config.redis.port = get_int(values, "redis.port", 6379);
+    config.postgres.host = get_string(values, "postgres.host");
+    config.postgres.port = get_int(values, "postgres.port", 5432);
+    config.postgres.database = get_string(values, "postgres.database");
+    config.postgres.user = get_string(values, "postgres.user");
+    config.postgres.password = get_string(values, "postgres.password");
+    config.kafka.brokers = split_csv(get_string(values, "kafka.brokers"));
+    config.kafka.transaction_topic = get_string(values, "kafka.transaction_topic");
+    config.kafka.consumer_group = get_string(values, "kafka.consumer_group");
+    config.risk.max_order_quantity = get_double(values, "risk.max_order_quantity", 0.0);
+    config.risk.max_order_notional = get_double(values, "risk.max_order_notional", 0.0);
+    config.risk.max_position_quantity = get_double(values, "risk.max_position_quantity", 0.0);
+    config.risk.stale_after_ms = get_int64(values, "risk.stale_after_ms", 0);
+    config.risk.kill_switch_enabled = parse_bool(get_string(values, "risk.kill_switch_enabled"));
+    config.strategy.strategy_id = get_string(values, "strategy.id");
+    config.strategy.trigger_instrument_id = get_string(values, "strategy.trigger_instrument_id");
+    config.strategy.trigger_price = get_double(values, "strategy.trigger_price", 0.0);
+    config.strategy.order_quantity = get_double(values, "strategy.order_quantity", 0.0);
+    config.strategy.side = get_string(values, "strategy.side");
+    config.simulation.partial_fill_threshold = get_double(values, "simulation.partial_fill_threshold", 0.0);
+    config.simulation.partial_fill_ratio = get_double(values, "simulation.partial_fill_ratio", 0.0);
+    config.simulation.auto_complete_partial_fills = parse_bool(get_string(values, "simulation.auto_complete_partial_fills"));
+    config.allow_fallback = parse_bool(get_string(values, "infrastructure.allow_fallback"));
     return config;
 }
 

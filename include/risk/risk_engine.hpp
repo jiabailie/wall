@@ -30,7 +30,7 @@ public:
 private:
     [[nodiscard]] std::optional<double> resolve_reference_price(const trading::core::OrderRequest& request) const;
 
-    const trading::config::RiskConfig& config_;
+    trading::config::RiskConfig config_;
     const trading::market_data::MarketStateStore& market_state_store_;
     const trading::core::IClock& clock_;
 };
