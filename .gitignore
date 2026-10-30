@@ -49,3 +49,11 @@ plan/
 # build
 build/
 cmake-build-debug/
+
+# Local tooling
+cmake-build-*/
+build-*/
+.vscode/
+.cache/
+compile_commands.json
+.DS_Store
