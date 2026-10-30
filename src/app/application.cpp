@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -78,12 +79,17 @@ std::shared_ptr<trading::strategy::StrategyCoordinator> build_strategy_coordinat
 
 }  // namespace
 
-// Loads configuration and prints a minimal startup summary for the current scaffold.
+// Stores an optional config path; empty means the default development config.
+Application::Application(std::string config_path) : config_path_(std::move(config_path)) {}
+
+// Loads configuration and runs one mock-driven simulation cycle.
 void Application::run() {
     trading::config::ConfigLoader loader;
 
-    // Step 1: Load the development configuration file.
-    const auto config = loader.load_from_file(std::string(TRADING_SOURCE_DIR) + "/configs/development.cfg");
+    // Step 1: Load the configuration file, defaulting to the development config.
+    const auto config_path =
+        config_path_.empty() ? std::string(TRADING_SOURCE_DIR) + "/configs/development.cfg" : config_path_;
+    const auto config = loader.load_from_file(config_path);
 
     // Step 2: Validate the required settings before proceeding.
     const auto validation = loader.validate(config);
@@ -122,6 +128,16 @@ void Application::run() {
         market_cache = std::make_unique<trading::infrastructure::HiredisMarketStateCache>(config.redis);
         kafka_client = std::make_unique<trading::infrastructure::RdKafkaConsumerClient>(config.kafka);
     } catch (const std::exception& exception) {
+        if (!config.allow_fallback) {
+            logger.log(
+                trading::monitoring::LogLevel::error,
+                "infrastructure_unavailable",
+                {{"reason", exception.what()}});
+            throw std::runtime_error(
+                std::string("Native infrastructure unavailable and infrastructure.allow_fallback is false: ") +
+                exception.what());
+        }
+
         infrastructure_mode = "fallback";
         infrastructure_fallback_reason = exception.what();
 
